@@ -1,2 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Working dirs
 /planning
 /archive
+
+# ---------------------------------------------------------------------------
+# Regenerable pipeline output (review finding #5).
+# The working tree was 24 MB for ~31 KB of code. All of the below is rebuildable
+# from the crawl metadata, which IS tracked:
+#   python run.py fetch --all && python run.py ocr --all && python run.py index --all
+# ---------------------------------------------------------------------------
+
+# Vector store (was 15 MB, plus orphaned segment dirs)
+chroma_db/
+cg/chroma_db/
+bihar/chroma_db/
+
+# Downloaded source PDFs
+*_all_pdfs/
+
+# Extracted text and machine-translation output
+processed_docs.json
+translated_docs.json
+*/processed_docs.json
+*/translated_docs.json
+
+# On-demand translation cache (machine-specific, rebuilds itself)
+translation_cache.json
+
+# NOTE: crawl_metadata.json is deliberately NOT ignored. It is small, it is the
+# record of what was crawled and from where, and it is what lets a fresh clone
+# reconstruct its own PDF store.
