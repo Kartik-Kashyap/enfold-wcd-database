@@ -1,0 +1,36 @@
+# Pinned to the versions this pipeline was actually tested against.
+# transformers / torch / chromadb break each other across minor versions often
+# enough that "whatever's latest" is not a safe default (review finding #6).
+
+# --- Crawling ---
+requests==2.34.2
+beautifulsoup4==4.13.0
+
+# --- PDF text extraction & OCR ---
+pdfplumber==0.11.10
+pytesseract==0.3.13
+pdf2image==1.17.0
+
+# --- Embeddings & vector search ---
+# NOTE: torch was installed here as the CUDA 11.8 build (2.6.0+cu118). For GPU:
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu118
+# Plain `pip install -r requirements.txt` installs the CPU build, which works.
+torch==2.6.0
+transformers==5.15.1
+sentence-transformers==5.7.0
+chromadb==1.5.9
+numpy==2.4.4
+
+# --- UI & on-demand translation ---
+streamlit==1.58.0
+ollama==0.6.1
+
+# --- Tests ---
+pytest==8.3.4
+
+# ---------------------------------------------------------------------------
+# SYSTEM-LEVEL DEPENDENCIES (not installable via pip) — see README.md
+#   * Tesseract OCR + the Hindi language pack ('hin')
+#   * Poppler (required by pdf2image)
+#   * Ollama with llama3.2 pulled (only for on-demand translation / summaries)
+# ---------------------------------------------------------------------------
