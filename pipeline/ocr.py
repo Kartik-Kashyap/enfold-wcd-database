@@ -34,7 +34,7 @@ import pdfplumber
 import pytesseract
 from pdf2image import convert_from_path
 
-from . import jsonio, paths, quality
+from . import dates, jsonio, paths, quality
 from .states import StateConfig
 
 SAMPLE_PAGES = 3
@@ -211,6 +211,10 @@ def process_state(state: StateConfig, limit: int | None = None, flush_every: int
                 "state_key": state.key,
                 "category": meta.get("category", "General / Uncategorized"),
                 "link_text": meta.get("link_text", fname),
+                # Full-text extraction beats the crawl-time best effort (which
+                # only saw the text layer); fall back to it for scanned PDFs
+                # that had no text layer at crawl time.
+                "document_date": dates.extract_date(text) or meta.get("document_date"),
                 "char_count": len(text),
                 "was_ocr_used": was_ocr_used,
                 "text": text,

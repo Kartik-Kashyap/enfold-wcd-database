@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from datetime import date
 from pathlib import Path
 from urllib.parse import urljoin, urldefrag, urlparse
 from urllib.robotparser import RobotFileParser
@@ -31,7 +32,7 @@ from urllib.robotparser import RobotFileParser
 import requests
 from bs4 import BeautifulSoup
 
-from . import jsonio, paths
+from . import dates, jsonio, paths
 from .states import StateConfig
 
 DEFAULT_DELAY = 1.0
@@ -248,6 +249,12 @@ def crawl_state(
                         "state_key": state.key,
                         "category": category,
                         "link_text": link_text,
+                        # The document's own issue date, best-effort from the PDF's
+                        # text layer (no OCR at crawl time).  Scanned PDFs get
+                        # their date at the OCR stage instead.
+                        "document_date": dates.extract_date_from_pdf(target),
+                        # When we scraped it -- distinct from the document date.
+                        "crawled_at": date.today().isoformat(),
                     })
                     new_downloads += 1
 

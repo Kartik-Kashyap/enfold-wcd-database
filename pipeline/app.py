@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import sys
 from collections import Counter
+from datetime import date as date_cls
 from pathlib import Path
 
 import streamlit as st
@@ -31,7 +32,7 @@ import streamlit as st
 # Allow `streamlit run pipeline/app.py` as well as `python run.py app`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import jsonio, paths, translate  # noqa: E402
+from pipeline import dates, jsonio, paths, translate  # noqa: E402
 from pipeline.states import all_states  # noqa: E402
 
 st.set_page_config(page_title="Child Rights Legal & Policy Portal", layout="wide")
@@ -126,6 +127,40 @@ def _strip_count(label: str) -> str:
 
 selected_state = None if selected_state_label == "All States" else _strip_count(selected_state_label)
 selected_category = None if selected_category_label == "All Categories" else _strip_count(selected_category_label)
+
+# Date filter, following finding #10: the range comes from the data that
+# actually has dates, never a hardcoded span.  A checkbox gates it so the
+# default view still includes documents whose date could not be detected.
+st.sidebar.markdown("---")
+st.sidebar.header("📅 Filter by Date")
+dated_docs = [d for d in raw_docs if d.get("document_date")]
+if dated_docs:
+    date_min = date_cls.fromisoformat(min(d["document_date"] for d in dated_docs))
+    date_max = date_cls.fromisoformat(max(d["document_date"] for d in dated_docs))
+    enable_date = st.sidebar.checkbox(
+        "Enable date filter",
+        value=False,
+        help="When on, only documents dated within the range are shown; documents "
+             "whose date could not be detected are excluded.  Advanced search "
+             "needs the index rebuilt first: python run.py index --all",
+    )
+    date_range = st.sidebar.date_input(
+        "Document date range:",
+        value=(date_min, date_max),
+        min_value=date_min,
+        max_value=date_max,
+        disabled=not enable_date,
+    )
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        dlo, dhi = date_range
+    else:
+        dlo = dhi = date_range
+    st.sidebar.caption(f"{len(dated_docs)} of {len(raw_docs)} documents have a detected date.")
+else:
+    enable_date = False
+    dlo = dhi = None
+    st.sidebar.caption("No document dates in the database yet. Run:\n\n"
+                       "`python run.py backfill-dates --all` → `python run.py index --all`")
 
 st.sidebar.markdown("---")
 with st.sidebar.expander("📊 Coverage (what's actually in here)", expanded=False):
@@ -256,6 +291,10 @@ if search_mode.startswith("🔍"):
                 continue
             if selected_category and doc.get("category") != selected_category:
                 continue
+            if enable_date:
+                dd = doc.get("document_date")
+                if not dd or not (dlo.isoformat() <= dd <= dhi.isoformat()):
+                    continue
             haystack = " ".join([
                 doc.get("inferred_title", ""),
                 doc.get("link_text", ""),
@@ -277,6 +316,9 @@ if search_mode.startswith("🔍"):
             with st.expander(header, expanded=idx <= 3):
                 st.write(f"**Source page link text:** `{doc.get('link_text', 'N/A')}`")
                 st.write(f"**File name:** `{doc.get('filename', '')}`")
+                doc_date = doc.get("document_date")
+                st.write(f"📅 **Document date:** `{doc_date}`"
+                         if doc_date else "📅 **Document date:** not detected")
                 if doc.get("was_ocr_used"):
                     st.caption("ℹ️ Text extracted by OCR — expect some noise.")
 
@@ -317,6 +359,17 @@ else:
             conditions.append({"state": selected_state})
         if selected_category:
             conditions.append({"category": selected_category})
+        if enable_date:
+            # Range filters on ISO strings are not supported by Chroma's where
+            # clause; the index stores document_date_epoch (int) for this.
+            # Same epoch arithmetic as index.py (dates.date_epoch), so the
+            # app's range and the index's values always agree.
+            conditions.append({
+                "document_date_epoch": {
+                    "$gte": dates.date_epoch(dlo.isoformat()),
+                    "$lte": dates.date_epoch(dhi.isoformat()),
+                }
+            })
         where_filter = None
         if len(conditions) == 1:
             where_filter = conditions[0]
@@ -360,6 +413,8 @@ else:
                         st.caption(f"Similarity: {max(0.0, 1 - distance):.0%} · "
                                    f"chunk {meta.get('chunk_index', 0)} "
                                    f"(source chars {meta.get('hi_start', 0)}–{meta.get('hi_end', 0)})")
+                    if meta.get("document_date"):
+                        st.caption(f"📅 Document date: `{meta.get('document_date')}`")
                     if meta.get("was_ocr_used"):
                         st.caption("ℹ️ Text extracted by OCR — expect some noise.")
 

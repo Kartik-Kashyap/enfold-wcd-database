@@ -17,8 +17,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import quality
+from pipeline import dates, jsonio, quality
 from pipeline.chunking import chunk_with_offsets
+from pipeline.states import StateConfig
 from pipeline.translate import split_for_translation
 
 
@@ -274,6 +275,104 @@ class TestChunkOffsets:
     def test_no_infinite_loop_on_full_overlap(self):
         chunks = chunk_with_offsets("x" * 100, chunk_size=10, overlap=10)
         assert len(chunks) < 1000
+
+
+# ---------------------------------------------------------------------------
+# Document dates (pipeline/dates.py)
+# ---------------------------------------------------------------------------
+class TestDateExtraction:
+    def test_issue_anchor_numeric(self):
+        text = "क्रमांक 42 दिनांक 13/04/2026 को जारी किया गया परिपत्र।"
+        assert dates.extract_date(text) == "2026-04-13"
+
+    def test_di_abbreviation_with_dash(self):
+        assert dates.extract_date("दि. 15-03-2024") == "2024-03-15"
+
+    def test_anchor_with_colon_and_dots(self):
+        assert dates.extract_date("दिनांक: 15.03.2024") == "2024-03-15"
+
+    def test_hindi_digits(self):
+        assert dates.extract_date("दिनांक १५/०३/२०२४") == "2024-03-15"
+
+    def test_hindi_month_word(self):
+        assert dates.extract_date("दिनांक 15 मार्च 2024") == "2024-03-15"
+
+    def test_hindi_month_word_with_devanagari_year(self):
+        assert dates.extract_date("दिनांक १५ मार्च २०२४") == "2024-03-15"
+
+    def test_english_month_word(self):
+        assert dates.extract_date("dated 12 March 2024") == "2024-03-12"
+
+    def test_deadline_deprioritized(self):
+        text = ("आवेदन की अंतिम तिथि 30/06/2026 है। "
+                "यह परिपत्र दिनांक 15/03/2024 को जारी किया गया।")
+        assert dates.extract_date(text) == "2024-03-15"
+
+    def test_deadline_only_is_last_resort(self):
+        assert dates.extract_date("आवेदन की अंतिम तिथि 30/06/2026 है।") == "2026-06-30"
+
+    def test_issue_date_wins_over_earlier_bare_date(self):
+        text = "संदर्भ 20/11/2025 के पत्र से। दिनांक 15/03/2024"
+        assert dates.extract_date(text) == "2024-03-15"
+
+    def test_iso_form(self):
+        assert dates.extract_date("दिनांक 2024-03-15") == "2024-03-15"
+
+    def test_no_date(self):
+        assert dates.extract_date("कोई तिथि नहीं है इस दस्तावेज़ में।") is None
+
+    def test_empty_input(self):
+        assert dates.extract_date("") is None
+        assert dates.extract_date(None) is None
+
+    def test_garbage_is_not_a_date(self):
+        assert dates.extract_date("abc/def/ghij कुछ भी") is None
+
+    def test_invalid_calendar_date_skipped(self):
+        assert dates.extract_date("दिनांक 31/02/2024") is None
+
+    def test_invalid_month_skipped(self):
+        assert dates.extract_date("दिनांक 12/13/2024") is None
+
+    def test_out_of_range_year_skipped(self):
+        assert dates.extract_date("दिनांक 15/03/1985") is None
+
+    def test_date_epoch(self):
+        # Day-count arithmetic, timezone-free: date objects have no .timestamp().
+        assert dates.date_epoch("1970-01-02") == 86400
+        assert dates.date_epoch("2024-03-15") > dates.date_epoch("2024-01-01")
+        assert dates.date_epoch("2024-03-15") < dates.date_epoch("2024-12-31")
+
+    def test_date_epoch_rejects_junk(self):
+        assert dates.date_epoch("") is None
+        assert dates.date_epoch(None) is None
+        assert dates.date_epoch("not-a-date") is None
+        assert dates.date_epoch("2024-13-40") is None
+
+    def test_backfill_state_roundtrip(self, tmp_path):
+        """Existing data gets dates without re-OCR; crawl metadata stays in sync."""
+        state = StateConfig(
+            key="test", name="Test", start_url="https://example.in/",
+            data_dirname=str(tmp_path), pdf_dirname="pdfs",
+        )
+        jsonio.write_json_atomic(state.processed_docs, [
+            {"id": "doc_1", "filename": "a_1.pdf", "text": "परिपत्र दिनांक 15/03/2024 को जारी।"},
+            {"id": "doc_2", "filename": "b_2.pdf", "text": "कोई तिथि नहीं।"},
+        ])
+        jsonio.write_json_atomic(state.crawl_metadata, [
+            {"filename": "a_1.pdf"}, {"filename": "b_2.pdf"},
+        ])
+
+        docs, dated = dates.backfill_state(state)
+        assert (docs, dated) == (2, 1)
+
+        docs = jsonio.read_json(state.processed_docs)
+        assert docs[0]["document_date"] == "2024-03-15"
+        assert "document_date" not in docs[1]
+
+        meta = jsonio.read_json(state.crawl_metadata)
+        assert meta[0]["document_date"] == "2024-03-15"
+        assert "document_date" not in meta[1]
 
 
 # ---------------------------------------------------------------------------

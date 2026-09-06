@@ -61,6 +61,13 @@ STATES: dict[str, StateConfig] = {
         data_dirname="bihar",
         pdf_dirname="bhwcd_all_pdfs",
     ),
+    "odisha": StateConfig(
+        key="odisha",
+        name="Odisha",
+        start_url="https://wcd.odisha.gov.in/",
+        data_dirname="odisha",
+        pdf_dirname="odwcd_all_pdfs",
+    ),
 }
 
 

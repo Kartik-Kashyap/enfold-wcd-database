@@ -95,11 +95,33 @@ Each stage is independently re-runnable and resumes where it left off.
 | `run.py fetch --all` | Re-download PDFs listed in crawl metadata but absent locally |
 | `run.py ocr --all` | Extract text; OCR only when the text layer is unusable |
 | `run.py index --all` | Embed **Hindi** text into Chroma (per-state, incremental) |
+| `run.py backfill-dates --all` | Extract `document_date` from already-extracted text (no re-OCR) |
 | `run.py app` | Launch Streamlit |
 | `run.py audit --file cg/translated_docs.json` | Run the quality guard over old MT output |
 
 Useful flags: `crawl --depth 2 --delay 1.0 --max-pages 50`, `ocr --limit 5`,
 `index --no-prune`, `app --port 8502`.
+
+### Document dates
+
+Every record carries two dates:
+
+* **`document_date`** — the document's own issue date (e.g. `दिनांक 15/03/2024`),
+  extracted from the PDF text by `pipeline/dates.py` (anchored `दिनांक`/`दि.`/`dated`
+  forms, Hindi digits and month words; deadlines like `अंतिम तिथि` are only used
+  as a last resort).  Stored as ISO `YYYY-MM-DD` in `crawl_metadata.json` and
+  `processed_docs.json`, and as `document_date` + `document_date_epoch` in the
+  vector index (epoch exists because Chroma's range filters work on numbers).
+* **`crawled_at`** — when *we* scraped the PDF (new crawls only; existing states
+  never had it, which is fine — it is not the document's date).
+
+The GUI's "Filter by Date" range comes from the dates actually present in the
+data.  Data crawled before dates existed needs one pass:
+
+```bash
+python run.py backfill-dates --all   # dates into the JSON
+python run.py index --all            # dates into the vector index
+```
 
 ### Before crawling
 
@@ -204,6 +226,7 @@ pipeline/
   states.py                State registry — the only place states are configured
   paths.py                 Portable paths, Tesseract discovery
   crawler.py               Polite crawler + PDF re-fetch
+  dates.py                 Document date extraction (दिनांक 15/03/2024 → 2024-03-15)
   ocr.py                   Text extraction, OCR only when needed
   chunking.py              Chunking with exact source offsets (dependency-free)
   index.py                 Hindi embeddings into Chroma
@@ -246,5 +269,6 @@ real llama3.2 refusal observed while building this).
 
 Run `python run.py status` for live numbers. As of the last run: Chhattisgarh has
 45 PDFs crawled and 4 with extracted text; Bihar has 90 crawled and 0 processed.
+Odisha is configured (start URL `https://wcd.odisha.gov.in/`) but not yet crawled.
 Two states crawled, one partially searchable — treat the current index as a
 demo, not as coverage.
