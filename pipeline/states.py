@@ -68,6 +68,20 @@ STATES: dict[str, StateConfig] = {
         data_dirname="odisha",
         pdf_dirname="odwcd_all_pdfs",
     ),
+    "up": StateConfig(
+        key="up",
+        name="Uttar Pradesh",
+        start_url="https://balvikasup.gov.in/",
+        data_dirname="up",
+        pdf_dirname="upwcd_all_pdfs",
+    ),
+    "delhi": StateConfig(
+        key="delhi",
+        name="Delhi",
+        start_url="https://wcd.delhi.gov.in/",
+        data_dirname="delhi",
+        pdf_dirname="dwcd_all_pdfs",
+    ),
 }
 
 

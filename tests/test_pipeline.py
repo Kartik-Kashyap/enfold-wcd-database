@@ -40,6 +40,11 @@ class TestNeedsOcr:
         sample = "छत्तीसगढ़ शासन महिला एवं बाल विकास विभाग द्वारा जारी परिपत्र क्रमांक ४२१ दिनांक १५ मार्च २०२४। " * 3
         assert quality.needs_ocr(sample) is False
 
+    def test_odia_text_layer_skips_ocr(self):
+        """Odia-script (Oriya) Odisha PDFs have a usable text layer too."""
+        sample = "ଓଡ଼ିଶା ରାଜ୍ୟ ମହିଳା ଓ ଶିଶୁ ବିକାଶ ବିଭାଗ ଦ୍ୱାରା ଜାରି ହୋଇଥିବା ପରିପତ୍ର । " * 3
+        assert quality.needs_ocr(sample) is False
+
     def test_scanned_page_with_no_text_layer_needs_ocr(self):
         assert quality.needs_ocr("") is True
         assert quality.needs_ocr("   \n  \n ") is True

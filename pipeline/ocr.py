@@ -40,7 +40,7 @@ from .states import StateConfig
 SAMPLE_PAGES = 3
 RASTER_CHUNK_PAGES = 5
 OCR_DPI = 150
-OCR_LANGS = "hin+eng"
+OCR_LANGS = "hin+eng+ori"
 
 
 class TesseractMissing(RuntimeError):
@@ -58,7 +58,8 @@ def configure_tesseract() -> str:
             "             set TESSERACT_CMD=C:\\Program Files\\Tesseract-OCR\\tesseract.exe\n"
             "    macOS:   brew install tesseract tesseract-lang\n"
             "    Debian:  sudo apt install tesseract-ocr tesseract-ocr-hin\n"
-            "  The Hindi language pack ('hin') is required."
+            "  The Hindi language pack ('hin') is required; Odisha PDFs also need\n"
+            "  the Odia pack ('ori', e.g. sudo apt install tesseract-ocr-ori)."
         )
     pytesseract.pytesseract.tesseract_cmd = cmd
     return cmd
@@ -98,7 +99,9 @@ def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES) -> 
                 force_ocr = True
             else:
                 # Fast path -- this is the branch the old heuristic made unreachable.
-                layer = "Unicode Hindi" if quality.DEVANAGARI_RE.search(sample) else "readable Latin"
+                layer = ("Unicode Indic"
+                         if (quality.DEVANAGARI_RE.search(sample) or quality.ODIA_RE.search(sample))
+                         else "readable Latin")
                 print(f"    [usable text layer: {layer}] using pdfplumber, skipping OCR")
                 for page in pdf.pages:
                     text = page.extract_text()

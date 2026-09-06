@@ -24,6 +24,11 @@ import re
 from dataclasses import dataclass, field
 
 DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
+# Odia (Oriya) script, U+0B00-U+0B7F.  Odisha WCD documents are frequently
+# published in Odia, and a readable Odia text layer needs no OCR any more than
+# a Hindi one does -- without this, every such PDF would be rasterised for
+# nothing and re-read through the Hindi OCR pack.
+ODIA_RE = re.compile(r"[଀-୿]")
 LATIN_RE = re.compile(r"[A-Za-z]")
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
@@ -301,16 +306,16 @@ def needs_ocr(sample_text: str) -> bool:
     nothing.  What actually matters is whether the embedded text layer is
     *usable*:
 
-    * too little text          -> scanned image, OCR
-    * contains Devanagari      -> already Unicode Hindi, no OCR
-    * legacy-font garble       -> OCR (this is the Kruti Dev case)
-    * readable Latin script    -> usable English text layer, no OCR
-    * anything else            -> let OCR try
+    * too little text           -> scanned image, OCR
+    * contains Devanagari/Odia  -> already Unicode Indic text, no OCR
+    * legacy-font garble        -> OCR (this is the Kruti Dev case)
+    * readable Latin script     -> usable English text layer, no OCR
+    * anything else             -> let OCR try
     """
     sample = (sample_text or "").strip()
     if len(sample) < 100:
         return True
-    if DEVANAGARI_RE.search(sample):
+    if DEVANAGARI_RE.search(sample) or ODIA_RE.search(sample):
         return False
     if looks_like_legacy_font(sample):
         return True
