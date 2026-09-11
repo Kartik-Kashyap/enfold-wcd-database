@@ -17,9 +17,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import dates, jsonio, quality
+from pipeline import crawler, dates, jsonio, quality
 from pipeline.chunking import chunk_with_offsets
-from pipeline.states import StateConfig
+from pipeline.states import STATES, StateConfig
 from pipeline.translate import split_for_translation
 
 
@@ -87,6 +87,49 @@ class TestLegacyFontDetection:
 
     def test_krutidev_signatures_detected(self):
         assert quality.looks_like_legacy_font("NRR 'kklu =kk vkS") is True
+
+
+# ---------------------------------------------------------------------------
+# Handler-served PDFs (UP's DownloadFile*.ashx?Id=...) vs. extension-based links
+# ---------------------------------------------------------------------------
+class TestResponseIsPdf:
+    def test_pdf_content_type(self):
+        assert crawler.response_is_pdf("application/pdf")
+        assert crawler.response_is_pdf("Application/PDF; charset=binary")
+        assert crawler.response_is_pdf("application/pdf; name=go_1031.pdf")
+
+    def test_octet_stream_needs_magic_bytes(self):
+        assert crawler.response_is_pdf("application/octet-stream", b"%PDF-1.7 \x00\x01")
+        assert not crawler.response_is_pdf("application/octet-stream", b"<html><body>hi")
+        assert not crawler.response_is_pdf("binary/octet-stream", b"\x89PNG\r\n\x1a\n")
+
+    def test_non_pdf_responses_are_not_saved(self):
+        assert not crawler.response_is_pdf("text/html; charset=utf-8")
+        assert not crawler.response_is_pdf("image/png")
+        assert not crawler.response_is_pdf("application/msword")
+        assert not crawler.response_is_pdf("application/rtf")
+        assert not crawler.response_is_pdf("")
+        assert not crawler.response_is_pdf(None)
+
+
+# ---------------------------------------------------------------------------
+# Per-state OCR language config (Odisha opts into 'ori'; the rest stay fast)
+# ---------------------------------------------------------------------------
+class TestStateOcrLangs:
+    def test_odisha_opts_into_odia(self):
+        assert STATES["odisha"].ocr_langs == "hin+eng+ori"
+
+    def test_default_states_stay_fast(self):
+        for key in ("cg", "bihar", "up", "delhi"):
+            assert STATES[key].ocr_langs == "hin+eng"
+
+    def test_dataclass_default_matches_module_default(self):
+        """A hand-built StateConfig without ocr_langs must fall back to hin+eng."""
+        from pipeline import ocr
+        assert StateConfig(
+            key="x", name="X", start_url="https://x.in/",
+            data_dirname="x", pdf_dirname="pdfs",
+        ).ocr_langs == ocr.OCR_LANGS == "hin+eng"
 
 
 # ---------------------------------------------------------------------------

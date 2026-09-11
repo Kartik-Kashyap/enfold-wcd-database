@@ -24,6 +24,10 @@ class StateConfig:
     start_url: str
     data_dirname: str   # Directory under the repo root holding this state's data
     pdf_dirname: str    # PDF store, nested inside the data dir
+    # Tesseract languages for OCR.  Hindi/English covers most states; Odisha
+    # documents are in Odia script, which needs the 'ori' pack.  Adding 'ori'
+    # to every state costs ~40% OCR time per page, so it is opt-in here.
+    ocr_langs: str = "hin+eng"
 
     @property
     def domain(self) -> str:
@@ -67,6 +71,7 @@ STATES: dict[str, StateConfig] = {
         start_url="https://wcd.odisha.gov.in/",
         data_dirname="odisha",
         pdf_dirname="odwcd_all_pdfs",
+        ocr_langs="hin+eng+ori",
     ),
     "up": StateConfig(
         key="up",

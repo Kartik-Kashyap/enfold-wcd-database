@@ -42,6 +42,26 @@ SKIP_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".xlsx", ".x
 PROJECT_URL = "https://github.com/Kartik-Kashyap/Scraper"
 
 
+def response_is_pdf(content_type: str, sniff: bytes = b"") -> bool:
+    """True when an HTTP response is a PDF, decided from its Content-Type.
+
+    State portals frequently serve documents through handler URLs whose path has
+    no file extension -- UP's ``DownloadFileGO.ashx?Id=1031``, for example --
+    so a link branch that only matches ``*.pdf`` never fires for them.  When the
+    crawler follows such a link and the server answers ``application/pdf``, the
+    body is a document to save, not a page to discard.  Some servers use
+    ``application/octet-stream`` for PDFs too, where a ``%PDF`` magic-byte sniff
+    disambiguates; anything else (Word/Excel handlers, images) stays out of
+    scope, matching the ``SKIP_EXTENSIONS`` policy on the link branch.
+    """
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct.startswith("application/pdf"):
+        return True
+    if ct in ("application/octet-stream", "binary/octet-stream", "application/download"):
+        return sniff.startswith(b"%PDF")
+    return False
+
+
 def build_user_agent() -> str:
     """Identify the project, not a fake browser.
 
@@ -166,13 +186,34 @@ def crawl_state(
     print(f"  resuming:   {len(metadata)} PDFs already recorded")
 
     visited: set[str] = set()
-    queue: list[tuple[str, int]] = [(state.start_url, 0)]
+    queue: list[tuple[str, int, str, str]] = [(state.start_url, 0, state.start_url, "")]
     new_downloads = 0
     pages_fetched = 0
 
     with jsonio.BatchedJsonWriter(state.crawl_metadata, existing=metadata, flush_every=5) as writer:
+        def record(url: str, source: str, link_text: str, filename: str,
+                   category: str, target: Path) -> None:
+            writer.add({
+                "filename": filename,
+                # Stored with forward slashes, relative to the repo root
+                # (review finding #3) so it resolves on any OS.
+                "file_path": paths.repo_relative(target),
+                "pdf_url": url,
+                "source_page": source,
+                "state": state.name,
+                "state_key": state.key,
+                "category": category,
+                "link_text": link_text,
+                # The document's own issue date, best-effort from the PDF's text
+                # layer (no OCR at crawl time).  Scanned PDFs get their date at
+                # the OCR stage instead.
+                "document_date": dates.extract_date_from_pdf(target),
+                # When we scraped it -- distinct from the document date.
+                "crawled_at": date.today().isoformat(),
+            })
+
         while queue:
-            current_url, depth = queue.pop(0)
+            current_url, depth, source_page, link_text = queue.pop(0)
             current_url, _ = urldefrag(current_url)
             if current_url in visited or depth > max_depth:
                 continue
@@ -192,7 +233,32 @@ def crawl_state(
                 # Status first, then Content-Type (review finding #13): an error
                 # page must never reach the parser downstream.
                 response.raise_for_status()
-                if "text/html" not in response.headers.get("Content-Type", ""):
+                content_type = response.headers.get("Content-Type", "")
+
+                if "text/html" not in content_type:
+                    # A document served through a handler URL (UP's
+                    # DownloadFile*.ashx?Id=...) has no .pdf extension for the
+                    # link branch to match, so decide from the Content-Type and
+                    # save it exactly like a direct *.pdf link.  Anything that
+                    # is not a PDF is skipped, matching SKIP_EXTENSIONS.
+                    if response_is_pdf(content_type, response.content[:16]) \
+                            and current_url not in seen_pdf_urls:
+                        seen_pdf_urls.add(current_url)
+                        filename = f"{sanitize_filename(link_text or 'Document', file_index)}_{file_index}.pdf"
+                        file_index += 1
+                        state.pdf_dir.mkdir(parents=True, exist_ok=True)
+                        target = state.pdf_dir / filename
+                        category = determine_category(current_url, "", link_text)
+                        print(f"  [PDF via handler] {category} | {filename}")
+                        try:
+                            with target.open("wb") as f:
+                                f.write(response.content)
+                        except Exception as exc:
+                            print(f"  Failed saving {current_url}: {exc}")
+                            target.unlink(missing_ok=True)
+                            continue
+                        record(current_url, source_page, link_text, filename, category, target)
+                        new_downloads += 1
                     continue
             except Exception as exc:
                 print(f" Skipping {current_url}: {exc}")
@@ -238,24 +304,7 @@ def crawl_state(
                         target.unlink(missing_ok=True)
                         continue
 
-                    writer.add({
-                        "filename": filename,
-                        # Stored with forward slashes, relative to the repo root
-                        # (review finding #3) so it resolves on any OS.
-                        "file_path": paths.repo_relative(target),
-                        "pdf_url": absolute_url,
-                        "source_page": current_url,
-                        "state": state.name,
-                        "state_key": state.key,
-                        "category": category,
-                        "link_text": link_text,
-                        # The document's own issue date, best-effort from the PDF's
-                        # text layer (no OCR at crawl time).  Scanned PDFs get
-                        # their date at the OCR stage instead.
-                        "document_date": dates.extract_date_from_pdf(target),
-                        # When we scraped it -- distinct from the document date.
-                        "crawled_at": date.today().isoformat(),
-                    })
+                    record(absolute_url, current_url, link_text, filename, category, target)
                     new_downloads += 1
 
                 elif depth < max_depth:
@@ -263,7 +312,8 @@ def crawl_state(
                     if parsed.netloc == state.domain and parsed.scheme in ("http", "https"):
                         if not any(parsed.path.lower().endswith(ext) for ext in SKIP_EXTENSIONS):
                             if absolute_url not in visited:
-                                queue.append((absolute_url, depth + 1))
+                                queue.append((absolute_url, depth + 1,
+                                              current_url, link.text.strip() or absolute_url))
 
     print(f"\n Crawl complete for {state.name}: {new_downloads} new PDFs, "
           f"{pages_fetched} pages fetched.")
