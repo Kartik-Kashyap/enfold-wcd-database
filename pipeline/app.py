@@ -32,7 +32,7 @@ import streamlit as st
 # Allow `streamlit run pipeline/app.py` as well as `python run.py app`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import dates, jsonio, paths, translate  # noqa: E402
+from pipeline import filters, jsonio, paths, translate  # noqa: E402
 from pipeline.states import all_states  # noqa: E402
 
 st.set_page_config(page_title="Child Rights Legal & Policy Portal", layout="wide")
@@ -354,27 +354,17 @@ else:
     if query and collection is not None and collection.count() > 0:
         query_vector = embed_model.encode([query]).tolist()[0]
 
-        conditions = []
-        if selected_state:
-            conditions.append({"state": selected_state})
-        if selected_category:
-            conditions.append({"category": selected_category})
-        if enable_date:
-            # Range filters on ISO strings are not supported by Chroma's where
-            # clause; the index stores document_date_epoch (int) for this.
-            # Same epoch arithmetic as index.py (dates.date_epoch), so the
-            # app's range and the index's values always agree.
-            conditions.append({
-                "document_date_epoch": {
-                    "$gte": dates.date_epoch(dlo.isoformat()),
-                    "$lte": dates.date_epoch(dhi.isoformat()),
-                }
-            })
-        where_filter = None
-        if len(conditions) == 1:
-            where_filter = conditions[0]
-        elif len(conditions) > 1:
-            where_filter = {"$and": conditions}
+        # Chroma allows ONE operator per expression, so a date range is two
+        # conditions joined by $and.  filters.build_where_filter owns that
+        # shape (and is unit-tested); the epoch arithmetic it uses is the same
+        # dates.date_epoch that index.py stores, so the app's range and the
+        # indexed values always agree.
+        where_filter = filters.build_where_filter(
+            state=selected_state,
+            category=selected_category,
+            date_from=dlo.isoformat() if enable_date else None,
+            date_to=dhi.isoformat() if enable_date else None,
+        )
 
         results = collection.query(
             query_embeddings=[query_vector],

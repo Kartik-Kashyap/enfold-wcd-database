@@ -11,6 +11,7 @@ Run:  python -m pytest -q
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pipeline import crawler, dates, jsonio, quality
 from pipeline.chunking import chunk_with_offsets
+from pipeline.filters import build_where_filter
 from pipeline.states import STATES, StateConfig
 from pipeline.translate import split_for_translation
 
@@ -421,6 +423,92 @@ class TestDateExtraction:
         meta = jsonio.read_json(state.crawl_metadata)
         assert meta[0]["document_date"] == "2024-03-15"
         assert "document_date" not in meta[1]
+
+
+# ---------------------------------------------------------------------------
+# The GUI date filter (found broken by an end-to-end run, not by these tests)
+# ---------------------------------------------------------------------------
+def _assert_chroma_legal(node, path="$"):
+    """Assert every operator expression holds exactly ONE operator.
+
+    This is the rule Chroma enforces at query time::
+
+        ValueError: Expected operator expression to have exactly one operator
+
+    An operator expression is a ``{field: {"$op": value}}`` mapping.  Walking
+    the clause and checking it structurally catches the mistake without
+    importing chromadb (and torch) into the suite.
+    """
+    if not isinstance(node, dict):
+        return
+    for key, value in node.items():
+        if key == "$and":
+            assert isinstance(value, list) and value, f"{path}.$and must be a non-empty list"
+            for i, sub in enumerate(value):
+                _assert_chroma_legal(sub, f"{path}.$and[{i}]")
+        elif key.startswith("$"):
+            raise AssertionError(f"{path}: operator {key} outside an expression")
+        elif isinstance(value, dict):
+            # An operator expression: {"field": {"$op": value}}.
+            ops = [k for k in value if k.startswith("$")]
+            assert len(ops) == 1, (
+                f"{path}.{key} has {len(ops)} operators {ops}; Chroma allows exactly one. "
+                "A range needs two conditions joined by $and."
+            )
+        # else: a plain equality condition ({"state": "Delhi"}) -- a scalar,
+        # and legal as-is.  Only operator expressions carry the one-op rule.
+
+
+class TestWhereFilter:
+    def test_no_filters_is_none(self):
+        assert build_where_filter() is None
+
+    def test_single_condition_is_not_wrapped_in_and(self):
+        where = build_where_filter(state="Delhi")
+        assert where == {"state": "Delhi"}
+        _assert_chroma_legal(where)
+
+    def test_date_range_is_two_conditions_joined_by_and(self):
+        """The regression: one dict with $gte AND $lte is rejected by Chroma."""
+        where = build_where_filter(date_from="2025-01-01", date_to="2026-12-31")
+        _assert_chroma_legal(where)
+
+        lo = dates.date_epoch("2025-01-01")
+        hi = dates.date_epoch("2026-12-31")
+        assert where == {"$and": [
+            {"document_date_epoch": {"$gte": lo}},
+            {"document_date_epoch": {"$lte": hi}},
+        ]}
+        # The shape that actually broke it, spelled out.
+        assert where != {"document_date_epoch": {"$gte": lo, "$lte": hi}}
+
+    def test_date_range_with_state_and_category(self):
+        where = build_where_filter(state="Delhi", category="Acts",
+                                   date_from="2025-01-01", date_to="2026-12-31")
+        _assert_chroma_legal(where)
+        assert len(where["$and"]) == 4
+        assert {"state": "Delhi"} in where["$and"]
+        assert {"category": "Acts"} in where["$and"]
+
+    def test_open_ended_range_is_a_single_operator(self):
+        where = build_where_filter(date_from="2025-01-01")
+        assert where == {"document_date_epoch": {"$gte": dates.date_epoch("2025-01-01")}}
+        _assert_chroma_legal(where)
+
+    def test_unparseable_dates_are_dropped_not_emitted_as_none(self):
+        """Chroma rejects None inside a where clause."""
+        assert build_where_filter(date_from="not-a-date") is None
+        assert build_where_filter(date_from="", date_to=None) is None
+
+        where = build_where_filter(state="Delhi", date_from="not-a-date")
+        assert where == {"state": "Delhi"}
+
+    def test_epochs_match_the_indexed_values(self):
+        """The app's range must use the same arithmetic index.py stored with."""
+        where = build_where_filter(date_from="2024-06-01")
+        assert (where["document_date_epoch"]["$gte"]
+                == dates.date_epoch("2024-06-01")
+                == (date(2024, 6, 1) - date(1970, 1, 1)).days * 86400)
 
 
 # ---------------------------------------------------------------------------
