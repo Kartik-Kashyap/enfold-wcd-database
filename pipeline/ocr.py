@@ -27,6 +27,7 @@ a 500-page PDF, and resume-on-restart.
 from __future__ import annotations
 
 import gc
+import os
 import re
 from pathlib import Path
 
@@ -34,13 +35,36 @@ import pdfplumber
 import pytesseract
 from pdf2image import convert_from_path
 
-from . import jsonio, paths, quality
+from . import dates, jsonio, paths, quality
 from .states import StateConfig
 
 SAMPLE_PAGES = 3
 RASTER_CHUNK_PAGES = 5
 OCR_DPI = 150
+# Pages per reopen when reading an *embedded* text layer.  Larger than the OCR
+# chunk because extraction is far cheaper per page than rasterising, but still
+# bounded on purpose -- see _read_text_layer for why the bound matters.
+TEXT_CHUNK_PAGES = 24
+# Fallback when no state resolves an explicit language set; the default
+# StateConfig.ocr_langs is the same.  Odisha opts into 'ori' via its state entry.
 OCR_LANGS = "hin+eng"
+
+
+def _tessdata_config() -> str:
+    """Return a tesseract ``--tessdata-dir`` config from the ``TESSDATA_DIR`` env var.
+
+    An escape hatch for swapping OCR models without touching code: point
+    ``TESSDATA_DIR`` at a directory of ``*.traineddata`` files (they are plain
+    data, so no sudo needed) to override the system tessdata directory.  Unset
+    -- the default -- means "use the system models".
+
+    Measured on the deployment box: ``tessdata_fast`` ran at the same speed as
+    the stock Debian models (~35 s per dense Hindi page, identical output), so
+    this stays unset in production; the OCR cost there is CPU-bound, not
+    model-bound.
+    """
+    td = os.environ.get("TESSDATA_DIR", "").strip()
+    return f"--tessdata-dir {td}" if td else ""
 
 
 class TesseractMissing(RuntimeError):
@@ -58,7 +82,8 @@ def configure_tesseract() -> str:
             "             set TESSERACT_CMD=C:\\Program Files\\Tesseract-OCR\\tesseract.exe\n"
             "    macOS:   brew install tesseract tesseract-lang\n"
             "    Debian:  sudo apt install tesseract-ocr tesseract-ocr-hin\n"
-            "  The Hindi language pack ('hin') is required."
+            "  The Hindi language pack ('hin') is required; Odisha PDFs also need\n"
+            "  the Odia pack ('ori', e.g. sudo apt install tesseract-ocr-ori)."
         )
     pytesseract.pytesseract.tesseract_cmd = cmd
     return cmd
@@ -71,7 +96,40 @@ def check_hindi_langpack() -> bool:
         return True  # can't tell; let the OCR call surface any real problem
 
 
-def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES) -> tuple[str, bool]:
+def _read_text_layer(pdf_path: Path, total_pages: int,
+                     chunk_size: int = TEXT_CHUNK_PAGES) -> str:
+    """Read the embedded text layer in page batches, reopening per batch.
+
+    Reopening is the whole point.  pdfplumber -- and pdfminer beneath it --
+    retains a ``PDFPage`` for every page touched, and each one holds its
+    decoded resources, so reading a document in a single pass keeps all of it
+    resident.  On the deployment box (956 MiB, no swap headroom) a 47 MB Delhi
+    e-booklet did exactly that and the OOM killer took the process, losing the
+    63 documents the run had already banked.
+
+    Batching bounds peak memory by ``chunk_size`` rather than by page count,
+    and ``flush_cache()`` drops each page's decoded images as soon as its text
+    is out.  The cost is re-parsing the xref once per batch, which is small
+    next to extraction.
+
+    Note this is the *text layer* path, which the old code reached rarely
+    because the OCR gate was broken (finding #2).  Now that documents with a
+    usable text layer actually take it, its memory profile matters.
+    """
+    parts: list[str] = []
+    for start in range(0, total_pages, chunk_size):
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages[start:start + chunk_size]:
+                text = page.extract_text()
+                if text:
+                    parts.append(text.strip())
+                page.flush_cache()
+        gc.collect()
+    return "\n\n".join(parts)
+
+
+def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES,
+                 lang: str = OCR_LANGS) -> tuple[str, bool]:
     """Return ``(text, was_ocr_used)`` for one PDF."""
     pdf_path = Path(pdf_path)
     parts: list[str] = []
@@ -98,19 +156,19 @@ def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES) -> 
                 force_ocr = True
             else:
                 # Fast path -- this is the branch the old heuristic made unreachable.
-                layer = "Unicode Hindi" if quality.DEVANAGARI_RE.search(sample) else "readable Latin"
+                layer = ("Unicode Indic"
+                         if (quality.DEVANAGARI_RE.search(sample) or quality.ODIA_RE.search(sample))
+                         else "readable Latin")
                 print(f"    [usable text layer: {layer}] using pdfplumber, skipping OCR")
-                for page in pdf.pages:
-                    text = page.extract_text()
-                    if text:
-                        parts.append(text.strip())
-                return "\n\n".join(parts), False
     except Exception as exc:
         print(f"    [pdfplumber failed: {exc}] falling back to OCR")
         force_ocr = True
 
+    # Deliberately outside the `with`: the handle above is released first, so
+    # the batched read below is the only thing holding the document open.  A
+    # large PDF pinned by both would defeat the batching.
     if not force_ocr:
-        return "\n\n".join(parts), False
+        return _read_text_layer(pdf_path, total_pages), False
 
     if total_pages == 0:
         try:
@@ -127,7 +185,8 @@ def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES) -> 
                 str(pdf_path), first_page=start_page, last_page=end_page, dpi=OCR_DPI
             )
             for img in images:
-                ocr_text = pytesseract.image_to_string(img, lang=OCR_LANGS)
+                ocr_text = pytesseract.image_to_string(img, lang=lang,
+                                                       config=_tessdata_config())
                 if ocr_text.strip():
                     parts.append(ocr_text.strip())
             # Memory discipline: release each page chunk before rasterising the
@@ -162,12 +221,14 @@ def _next_doc_number(existing: list[dict]) -> int:
     return highest + 1
 
 
-def process_state(state: StateConfig, limit: int | None = None, flush_every: int = 5) -> int:
+def process_state(state: StateConfig, limit: int | None = None, flush_every: int = 1) -> int:
     """OCR/extract every un-processed PDF for one state. Returns count processed."""
     paths.configure_stdout()
     cmd = configure_tesseract()
     print(f"\n=== Extracting text: {state.name} ===")
     print(f"  tesseract: {cmd}")
+    langs = getattr(state, "ocr_langs", OCR_LANGS)
+    print(f"  ocr langs: {langs}")
     if not check_hindi_langpack():
         print("  WARNING: Tesseract has no 'hin' language pack -- Hindi OCR will be poor.")
 
@@ -196,7 +257,7 @@ def process_state(state: StateConfig, limit: int | None = None, flush_every: int
         for idx, fname in enumerate(todo, start=1):
             pdf_path = state.pdf_dir / fname
             print(f"\n[{idx}/{len(todo)}] {fname}")
-            text, was_ocr_used = extract_text(pdf_path)
+            text, was_ocr_used = extract_text(pdf_path, lang=langs)
 
             meta = crawl_meta.get(fname, {})
             fallback_title = meta.get("link_text") or Path(fname).stem
@@ -211,6 +272,10 @@ def process_state(state: StateConfig, limit: int | None = None, flush_every: int
                 "state_key": state.key,
                 "category": meta.get("category", "General / Uncategorized"),
                 "link_text": meta.get("link_text", fname),
+                # Full-text extraction beats the crawl-time best effort (which
+                # only saw the text layer); fall back to it for scanned PDFs
+                # that had no text layer at crawl time.
+                "document_date": dates.extract_date(text) or meta.get("document_date"),
                 "char_count": len(text),
                 "was_ocr_used": was_ocr_used,
                 "text": text,

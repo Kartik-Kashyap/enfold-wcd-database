@@ -5,6 +5,7 @@
     python run.py fetch  --all                # re-download PDFs from crawl metadata
     python run.py ocr    --state bihar        # extract text (OCR only when needed)
     python run.py index  --all                # embed the HINDI text into Chroma
+    python run.py backfill-dates --all        # extract document dates from existing text
     python run.py app                         # launch the Streamlit UI
     python run.py audit  --file cg/translated_docs.json
                                               # run the quality guard over old MT output
@@ -127,6 +128,25 @@ def cmd_app(args) -> int:
     return subprocess.call(cmd)
 
 
+def cmd_backfill_dates(args) -> int:
+    """Extract document dates from already-extracted text into JSON metadata.
+
+    Pre-existing data (cg, bihar) was crawled before date extraction existed.
+    This re-runs extraction over every processed document's text -- no re-OCR
+    needed -- and writes ``document_date`` into both processed_docs.json and
+    crawl_metadata.json.  New crawls record dates natively.
+    """
+    paths.configure_stdout()
+    from pipeline import dates
+
+    for state in states_mod.resolve(args.state, args.all):
+        docs, dated = dates.backfill_state(state)
+        print(f"[{state.name}] {dated} of {docs} processed documents have a date.")
+    print("\nThen re-run:  python run.py index --all")
+    print("so the vector index metadata picks up the dates (GUI date filter needs it).")
+    return 0
+
+
 def cmd_audit(args) -> int:
     """Run the translation quality guard over an existing MT output file.
 
@@ -208,6 +228,10 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("app", help="Launch the Streamlit UI")
     p.add_argument("--port", type=int, default=None)
     p.set_defaults(func=cmd_app)
+
+    p = sub.add_parser("backfill-dates", help="Extract document dates from existing extracted text")
+    _add_state_args(p)
+    p.set_defaults(func=cmd_backfill_dates)
 
     p = sub.add_parser("audit", help="Run the translation quality guard over an MT output file")
     p.add_argument("--file", default="cg/translated_docs.json")

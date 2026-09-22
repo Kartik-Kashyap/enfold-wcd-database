@@ -40,7 +40,7 @@ from pathlib import Path
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-from . import jsonio, paths
+from . import dates, jsonio, paths
 from .chunking import CHUNK_OVERLAP, CHUNK_SIZE, chunk_with_offsets
 from .states import StateConfig
 
@@ -131,7 +131,8 @@ def index_states(states: list[StateConfig], db_path: Path | None = None,
 
             for i, (chunk, start, end) in enumerate(chunks):
                 texts.append(chunk)
-                metadatas.append({
+                doc_date = doc.get("document_date", "") or ""
+                meta = {
                     "doc_id": doc_id,
                     "filename": doc.get("filename", ""),
                     "title_hi": doc.get("inferred_title", ""),
@@ -141,6 +142,7 @@ def index_states(states: list[StateConfig], db_path: Path | None = None,
                     "category": doc.get("category", "General / Uncategorized"),
                     "file_path": doc.get("file_path", ""),
                     "pdf_url": doc.get("pdf_url", ""),
+                    "document_date": doc_date,
                     "chunk_index": i,
                     # Exact source span (finding #11): text[hi_start:hi_end] IS
                     # this chunk, so the app can widen context without guessing.
@@ -148,7 +150,11 @@ def index_states(states: list[StateConfig], db_path: Path | None = None,
                     "hi_end": end,
                     "was_ocr_used": bool(doc.get("was_ocr_used", False)),
                     "language": "hi",
-                })
+                }
+                epoch = dates.date_epoch(doc_date)
+                if epoch is not None:
+                    meta["document_date_epoch"] = epoch
+                metadatas.append(meta)
                 # Namespaced so doc_1 in Bihar cannot collide with doc_1 in
                 # Chhattisgarh inside the shared collection.
                 ids.append(f"{state.key}:{doc_id}:{i}")

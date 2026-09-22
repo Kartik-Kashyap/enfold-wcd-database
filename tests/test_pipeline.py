@@ -11,14 +11,17 @@ Run:  python -m pytest -q
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import quality
+from pipeline import crawler, dates, jsonio, quality
 from pipeline.chunking import chunk_with_offsets
+from pipeline.filters import build_where_filter
+from pipeline.states import STATES, StateConfig
 from pipeline.translate import split_for_translation
 
 
@@ -37,6 +40,11 @@ class TestNeedsOcr:
 
     def test_devanagari_text_layer_skips_ocr(self):
         sample = "छत्तीसगढ़ शासन महिला एवं बाल विकास विभाग द्वारा जारी परिपत्र क्रमांक ४२१ दिनांक १५ मार्च २०२४। " * 3
+        assert quality.needs_ocr(sample) is False
+
+    def test_odia_text_layer_skips_ocr(self):
+        """Odia-script (Oriya) Odisha PDFs have a usable text layer too."""
+        sample = "ଓଡ଼ିଶା ରାଜ୍ୟ ମହିଳା ଓ ଶିଶୁ ବିକାଶ ବିଭାଗ ଦ୍ୱାରା ଜାରି ହୋଇଥିବା ପରିପତ୍ର । " * 3
         assert quality.needs_ocr(sample) is False
 
     def test_scanned_page_with_no_text_layer_needs_ocr(self):
@@ -81,6 +89,164 @@ class TestLegacyFontDetection:
 
     def test_krutidev_signatures_detected(self):
         assert quality.looks_like_legacy_font("NRR 'kklu =kk vkS") is True
+
+
+# ---------------------------------------------------------------------------
+# Handler-served PDFs (UP's DownloadFile*.ashx?Id=...) vs. extension-based links
+# ---------------------------------------------------------------------------
+class TestResponseIsPdf:
+    def test_pdf_content_type(self):
+        assert crawler.response_is_pdf("application/pdf")
+        assert crawler.response_is_pdf("Application/PDF; charset=binary")
+        assert crawler.response_is_pdf("application/pdf; name=go_1031.pdf")
+
+    def test_octet_stream_needs_magic_bytes(self):
+        assert crawler.response_is_pdf("application/octet-stream", b"%PDF-1.7 \x00\x01")
+        assert not crawler.response_is_pdf("application/octet-stream", b"<html><body>hi")
+        assert not crawler.response_is_pdf("binary/octet-stream", b"\x89PNG\r\n\x1a\n")
+
+    def test_non_pdf_responses_are_not_saved(self):
+        assert not crawler.response_is_pdf("text/html; charset=utf-8")
+        assert not crawler.response_is_pdf("image/png")
+        assert not crawler.response_is_pdf("application/msword")
+        assert not crawler.response_is_pdf("application/rtf")
+        assert not crawler.response_is_pdf("")
+        assert not crawler.response_is_pdf(None)
+
+
+# ---------------------------------------------------------------------------
+# Per-state OCR language config (Odisha opts into 'ori'; the rest stay fast)
+# ---------------------------------------------------------------------------
+class TestStateOcrLangs:
+    def test_odisha_opts_into_odia(self):
+        assert STATES["odisha"].ocr_langs == "hin+eng+ori"
+
+    def test_default_states_stay_fast(self):
+        for key in ("cg", "bihar", "up", "delhi"):
+            assert STATES[key].ocr_langs == "hin+eng"
+
+    def test_dataclass_default_matches_module_default(self):
+        """A hand-built StateConfig without ocr_langs must fall back to hin+eng."""
+        from pipeline import ocr
+        assert StateConfig(
+            key="x", name="X", start_url="https://x.in/",
+            data_dirname="x", pdf_dirname="pdfs",
+        ).ocr_langs == ocr.OCR_LANGS == "hin+eng"
+
+
+# ---------------------------------------------------------------------------
+# Reading a large text layer without holding the whole document
+# ---------------------------------------------------------------------------
+class _FakePage:
+    def __init__(self, number, log):
+        self.number = number
+        self._log = log
+
+    def extract_text(self):
+        return f"page {self.number}"
+
+    def flush_cache(self):
+        self._log.append(("flush", self.number))
+
+
+class _FakePages:
+    def __init__(self, total, log):
+        self._total = total
+        self._log = log
+
+    def __len__(self):
+        return self._total
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return [_FakePage(i + 1, self._log)
+                    for i in range(*key.indices(self._total))]
+        return _FakePage(key + 1, self._log)
+
+
+class _FakePdf:
+    """Stands in for pdfplumber's PDF: sliceable .pages, context manager."""
+
+    def __init__(self, total, log):
+        self.pages = _FakePages(total, log)
+        self.log = log
+
+    def __enter__(self):
+        self.log.append(("open", None))
+        return self
+
+    def __exit__(self, *exc):
+        self.log.append(("close", None))
+        return False
+
+
+class TestBatchedTextLayer:
+    """A 47 MB Delhi PDF was OOM-killed mid-run; batching is the fix.
+
+    pdfplumber retains a PDFPage per page touched, so reading a document in one
+    pass keeps all of it resident.  These tests pin the batching contract --
+    reopen per chunk, page order preserved, every page released.
+    """
+
+    def test_reopens_once_per_chunk(self, monkeypatch):
+        from pipeline import ocr
+
+        log = []
+        opens = []
+
+        def fake_open(path):
+            opens.append(path)
+            return _FakePdf(50, log)
+
+        monkeypatch.setattr(ocr.pdfplumber, "open", fake_open)
+        text = ocr._read_text_layer(Path("big.pdf"), 50, chunk_size=24)
+
+        assert len(opens) == 3, "50 pages at 24/chunk is 24 + 24 + 2"
+        assert [k for k, _ in log if k == "close"] == ["close"] * 3
+        # The point of reopening: no handle outlives its batch.
+        assert len([k for k, _ in log if k == "open"]) == 3
+
+    def test_page_order_survives_the_reopens(self, monkeypatch):
+        from pipeline import ocr
+
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(50, []))
+        text = ocr._read_text_layer(Path("big.pdf"), 50, chunk_size=24)
+
+        assert text.split("\n\n") == [f"page {i}" for i in range(1, 51)]
+
+    def test_every_page_is_flushed(self, monkeypatch):
+        from pipeline import ocr
+
+        log = []
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(50, log))
+        ocr._read_text_layer(Path("big.pdf"), 50, chunk_size=24)
+
+        assert [n for k, n in log if k == "flush"] == list(range(1, 51))
+
+    def test_document_smaller_than_one_chunk_opens_once(self, monkeypatch):
+        from pipeline import ocr
+
+        opens = []
+        monkeypatch.setattr(ocr.pdfplumber, "open",
+                            lambda p: (opens.append(p), _FakePdf(3, []))[1])
+        text = ocr._read_text_layer(Path("small.pdf"), 3, chunk_size=24)
+
+        assert len(opens) == 1
+        assert text.split("\n\n") == ["page 1", "page 2", "page 3"]
+
+    def test_extract_text_routes_a_usable_layer_through_the_batched_read(self, monkeypatch):
+        """The fast path must not fall back to holding the document open."""
+        from pipeline import ocr
+
+        seen = []
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(3, []))
+        monkeypatch.setattr(ocr.quality, "needs_ocr", lambda s: False)
+        monkeypatch.setattr(ocr, "_read_text_layer",
+                            lambda path, total, **kw: (seen.append(total), "BATCHED")[1])
+
+        text, used_ocr = ocr.extract_text(Path("doc.pdf"))
+        assert (text, used_ocr) == ("BATCHED", False)
+        assert seen == [3]
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +440,190 @@ class TestChunkOffsets:
     def test_no_infinite_loop_on_full_overlap(self):
         chunks = chunk_with_offsets("x" * 100, chunk_size=10, overlap=10)
         assert len(chunks) < 1000
+
+
+# ---------------------------------------------------------------------------
+# Document dates (pipeline/dates.py)
+# ---------------------------------------------------------------------------
+class TestDateExtraction:
+    def test_issue_anchor_numeric(self):
+        text = "क्रमांक 42 दिनांक 13/04/2026 को जारी किया गया परिपत्र।"
+        assert dates.extract_date(text) == "2026-04-13"
+
+    def test_di_abbreviation_with_dash(self):
+        assert dates.extract_date("दि. 15-03-2024") == "2024-03-15"
+
+    def test_anchor_with_colon_and_dots(self):
+        assert dates.extract_date("दिनांक: 15.03.2024") == "2024-03-15"
+
+    def test_hindi_digits(self):
+        assert dates.extract_date("दिनांक १५/०३/२०२४") == "2024-03-15"
+
+    def test_hindi_month_word(self):
+        assert dates.extract_date("दिनांक 15 मार्च 2024") == "2024-03-15"
+
+    def test_hindi_month_word_with_devanagari_year(self):
+        assert dates.extract_date("दिनांक १५ मार्च २०२४") == "2024-03-15"
+
+    def test_english_month_word(self):
+        assert dates.extract_date("dated 12 March 2024") == "2024-03-12"
+
+    def test_deadline_deprioritized(self):
+        text = ("आवेदन की अंतिम तिथि 30/06/2026 है। "
+                "यह परिपत्र दिनांक 15/03/2024 को जारी किया गया।")
+        assert dates.extract_date(text) == "2024-03-15"
+
+    def test_deadline_only_is_last_resort(self):
+        assert dates.extract_date("आवेदन की अंतिम तिथि 30/06/2026 है।") == "2026-06-30"
+
+    def test_issue_date_wins_over_earlier_bare_date(self):
+        text = "संदर्भ 20/11/2025 के पत्र से। दिनांक 15/03/2024"
+        assert dates.extract_date(text) == "2024-03-15"
+
+    def test_iso_form(self):
+        assert dates.extract_date("दिनांक 2024-03-15") == "2024-03-15"
+
+    def test_no_date(self):
+        assert dates.extract_date("कोई तिथि नहीं है इस दस्तावेज़ में।") is None
+
+    def test_empty_input(self):
+        assert dates.extract_date("") is None
+        assert dates.extract_date(None) is None
+
+    def test_garbage_is_not_a_date(self):
+        assert dates.extract_date("abc/def/ghij कुछ भी") is None
+
+    def test_invalid_calendar_date_skipped(self):
+        assert dates.extract_date("दिनांक 31/02/2024") is None
+
+    def test_invalid_month_skipped(self):
+        assert dates.extract_date("दिनांक 12/13/2024") is None
+
+    def test_out_of_range_year_skipped(self):
+        assert dates.extract_date("दिनांक 15/03/1985") is None
+
+    def test_date_epoch(self):
+        # Day-count arithmetic, timezone-free: date objects have no .timestamp().
+        assert dates.date_epoch("1970-01-02") == 86400
+        assert dates.date_epoch("2024-03-15") > dates.date_epoch("2024-01-01")
+        assert dates.date_epoch("2024-03-15") < dates.date_epoch("2024-12-31")
+
+    def test_date_epoch_rejects_junk(self):
+        assert dates.date_epoch("") is None
+        assert dates.date_epoch(None) is None
+        assert dates.date_epoch("not-a-date") is None
+        assert dates.date_epoch("2024-13-40") is None
+
+    def test_backfill_state_roundtrip(self, tmp_path):
+        """Existing data gets dates without re-OCR; crawl metadata stays in sync."""
+        state = StateConfig(
+            key="test", name="Test", start_url="https://example.in/",
+            data_dirname=str(tmp_path), pdf_dirname="pdfs",
+        )
+        jsonio.write_json_atomic(state.processed_docs, [
+            {"id": "doc_1", "filename": "a_1.pdf", "text": "परिपत्र दिनांक 15/03/2024 को जारी।"},
+            {"id": "doc_2", "filename": "b_2.pdf", "text": "कोई तिथि नहीं।"},
+        ])
+        jsonio.write_json_atomic(state.crawl_metadata, [
+            {"filename": "a_1.pdf"}, {"filename": "b_2.pdf"},
+        ])
+
+        docs, dated = dates.backfill_state(state)
+        assert (docs, dated) == (2, 1)
+
+        docs = jsonio.read_json(state.processed_docs)
+        assert docs[0]["document_date"] == "2024-03-15"
+        assert "document_date" not in docs[1]
+
+        meta = jsonio.read_json(state.crawl_metadata)
+        assert meta[0]["document_date"] == "2024-03-15"
+        assert "document_date" not in meta[1]
+
+
+# ---------------------------------------------------------------------------
+# The GUI date filter (found broken by an end-to-end run, not by these tests)
+# ---------------------------------------------------------------------------
+def _assert_chroma_legal(node, path="$"):
+    """Assert every operator expression holds exactly ONE operator.
+
+    This is the rule Chroma enforces at query time::
+
+        ValueError: Expected operator expression to have exactly one operator
+
+    An operator expression is a ``{field: {"$op": value}}`` mapping.  Walking
+    the clause and checking it structurally catches the mistake without
+    importing chromadb (and torch) into the suite.
+    """
+    if not isinstance(node, dict):
+        return
+    for key, value in node.items():
+        if key == "$and":
+            assert isinstance(value, list) and value, f"{path}.$and must be a non-empty list"
+            for i, sub in enumerate(value):
+                _assert_chroma_legal(sub, f"{path}.$and[{i}]")
+        elif key.startswith("$"):
+            raise AssertionError(f"{path}: operator {key} outside an expression")
+        elif isinstance(value, dict):
+            # An operator expression: {"field": {"$op": value}}.
+            ops = [k for k in value if k.startswith("$")]
+            assert len(ops) == 1, (
+                f"{path}.{key} has {len(ops)} operators {ops}; Chroma allows exactly one. "
+                "A range needs two conditions joined by $and."
+            )
+        # else: a plain equality condition ({"state": "Delhi"}) -- a scalar,
+        # and legal as-is.  Only operator expressions carry the one-op rule.
+
+
+class TestWhereFilter:
+    def test_no_filters_is_none(self):
+        assert build_where_filter() is None
+
+    def test_single_condition_is_not_wrapped_in_and(self):
+        where = build_where_filter(state="Delhi")
+        assert where == {"state": "Delhi"}
+        _assert_chroma_legal(where)
+
+    def test_date_range_is_two_conditions_joined_by_and(self):
+        """The regression: one dict with $gte AND $lte is rejected by Chroma."""
+        where = build_where_filter(date_from="2025-01-01", date_to="2026-12-31")
+        _assert_chroma_legal(where)
+
+        lo = dates.date_epoch("2025-01-01")
+        hi = dates.date_epoch("2026-12-31")
+        assert where == {"$and": [
+            {"document_date_epoch": {"$gte": lo}},
+            {"document_date_epoch": {"$lte": hi}},
+        ]}
+        # The shape that actually broke it, spelled out.
+        assert where != {"document_date_epoch": {"$gte": lo, "$lte": hi}}
+
+    def test_date_range_with_state_and_category(self):
+        where = build_where_filter(state="Delhi", category="Acts",
+                                   date_from="2025-01-01", date_to="2026-12-31")
+        _assert_chroma_legal(where)
+        assert len(where["$and"]) == 4
+        assert {"state": "Delhi"} in where["$and"]
+        assert {"category": "Acts"} in where["$and"]
+
+    def test_open_ended_range_is_a_single_operator(self):
+        where = build_where_filter(date_from="2025-01-01")
+        assert where == {"document_date_epoch": {"$gte": dates.date_epoch("2025-01-01")}}
+        _assert_chroma_legal(where)
+
+    def test_unparseable_dates_are_dropped_not_emitted_as_none(self):
+        """Chroma rejects None inside a where clause."""
+        assert build_where_filter(date_from="not-a-date") is None
+        assert build_where_filter(date_from="", date_to=None) is None
+
+        where = build_where_filter(state="Delhi", date_from="not-a-date")
+        assert where == {"state": "Delhi"}
+
+    def test_epochs_match_the_indexed_values(self):
+        """The app's range must use the same arithmetic index.py stored with."""
+        where = build_where_filter(date_from="2024-06-01")
+        assert (where["document_date_epoch"]["$gte"]
+                == dates.date_epoch("2024-06-01")
+                == (date(2024, 6, 1) - date(1970, 1, 1)).days * 86400)
 
 
 # ---------------------------------------------------------------------------
