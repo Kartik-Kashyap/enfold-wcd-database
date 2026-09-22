@@ -41,6 +41,10 @@ from .states import StateConfig
 SAMPLE_PAGES = 3
 RASTER_CHUNK_PAGES = 5
 OCR_DPI = 150
+# Pages per reopen when reading an *embedded* text layer.  Larger than the OCR
+# chunk because extraction is far cheaper per page than rasterising, but still
+# bounded on purpose -- see _read_text_layer for why the bound matters.
+TEXT_CHUNK_PAGES = 24
 # Fallback when no state resolves an explicit language set; the default
 # StateConfig.ocr_langs is the same.  Odisha opts into 'ori' via its state entry.
 OCR_LANGS = "hin+eng"
@@ -92,6 +96,38 @@ def check_hindi_langpack() -> bool:
         return True  # can't tell; let the OCR call surface any real problem
 
 
+def _read_text_layer(pdf_path: Path, total_pages: int,
+                     chunk_size: int = TEXT_CHUNK_PAGES) -> str:
+    """Read the embedded text layer in page batches, reopening per batch.
+
+    Reopening is the whole point.  pdfplumber -- and pdfminer beneath it --
+    retains a ``PDFPage`` for every page touched, and each one holds its
+    decoded resources, so reading a document in a single pass keeps all of it
+    resident.  On the deployment box (956 MiB, no swap headroom) a 47 MB Delhi
+    e-booklet did exactly that and the OOM killer took the process, losing the
+    63 documents the run had already banked.
+
+    Batching bounds peak memory by ``chunk_size`` rather than by page count,
+    and ``flush_cache()`` drops each page's decoded images as soon as its text
+    is out.  The cost is re-parsing the xref once per batch, which is small
+    next to extraction.
+
+    Note this is the *text layer* path, which the old code reached rarely
+    because the OCR gate was broken (finding #2).  Now that documents with a
+    usable text layer actually take it, its memory profile matters.
+    """
+    parts: list[str] = []
+    for start in range(0, total_pages, chunk_size):
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages[start:start + chunk_size]:
+                text = page.extract_text()
+                if text:
+                    parts.append(text.strip())
+                page.flush_cache()
+        gc.collect()
+    return "\n\n".join(parts)
+
+
 def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES,
                  lang: str = OCR_LANGS) -> tuple[str, bool]:
     """Return ``(text, was_ocr_used)`` for one PDF."""
@@ -124,17 +160,15 @@ def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES,
                          if (quality.DEVANAGARI_RE.search(sample) or quality.ODIA_RE.search(sample))
                          else "readable Latin")
                 print(f"    [usable text layer: {layer}] using pdfplumber, skipping OCR")
-                for page in pdf.pages:
-                    text = page.extract_text()
-                    if text:
-                        parts.append(text.strip())
-                return "\n\n".join(parts), False
     except Exception as exc:
         print(f"    [pdfplumber failed: {exc}] falling back to OCR")
         force_ocr = True
 
+    # Deliberately outside the `with`: the handle above is released first, so
+    # the batched read below is the only thing holding the document open.  A
+    # large PDF pinned by both would defeat the batching.
     if not force_ocr:
-        return "\n\n".join(parts), False
+        return _read_text_layer(pdf_path, total_pages), False
 
     if total_pages == 0:
         try:

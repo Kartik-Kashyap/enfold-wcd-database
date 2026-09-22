@@ -135,6 +135,121 @@ class TestStateOcrLangs:
 
 
 # ---------------------------------------------------------------------------
+# Reading a large text layer without holding the whole document
+# ---------------------------------------------------------------------------
+class _FakePage:
+    def __init__(self, number, log):
+        self.number = number
+        self._log = log
+
+    def extract_text(self):
+        return f"page {self.number}"
+
+    def flush_cache(self):
+        self._log.append(("flush", self.number))
+
+
+class _FakePages:
+    def __init__(self, total, log):
+        self._total = total
+        self._log = log
+
+    def __len__(self):
+        return self._total
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return [_FakePage(i + 1, self._log)
+                    for i in range(*key.indices(self._total))]
+        return _FakePage(key + 1, self._log)
+
+
+class _FakePdf:
+    """Stands in for pdfplumber's PDF: sliceable .pages, context manager."""
+
+    def __init__(self, total, log):
+        self.pages = _FakePages(total, log)
+        self.log = log
+
+    def __enter__(self):
+        self.log.append(("open", None))
+        return self
+
+    def __exit__(self, *exc):
+        self.log.append(("close", None))
+        return False
+
+
+class TestBatchedTextLayer:
+    """A 47 MB Delhi PDF was OOM-killed mid-run; batching is the fix.
+
+    pdfplumber retains a PDFPage per page touched, so reading a document in one
+    pass keeps all of it resident.  These tests pin the batching contract --
+    reopen per chunk, page order preserved, every page released.
+    """
+
+    def test_reopens_once_per_chunk(self, monkeypatch):
+        from pipeline import ocr
+
+        log = []
+        opens = []
+
+        def fake_open(path):
+            opens.append(path)
+            return _FakePdf(50, log)
+
+        monkeypatch.setattr(ocr.pdfplumber, "open", fake_open)
+        text = ocr._read_text_layer(Path("big.pdf"), 50, chunk_size=24)
+
+        assert len(opens) == 3, "50 pages at 24/chunk is 24 + 24 + 2"
+        assert [k for k, _ in log if k == "close"] == ["close"] * 3
+        # The point of reopening: no handle outlives its batch.
+        assert len([k for k, _ in log if k == "open"]) == 3
+
+    def test_page_order_survives_the_reopens(self, monkeypatch):
+        from pipeline import ocr
+
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(50, []))
+        text = ocr._read_text_layer(Path("big.pdf"), 50, chunk_size=24)
+
+        assert text.split("\n\n") == [f"page {i}" for i in range(1, 51)]
+
+    def test_every_page_is_flushed(self, monkeypatch):
+        from pipeline import ocr
+
+        log = []
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(50, log))
+        ocr._read_text_layer(Path("big.pdf"), 50, chunk_size=24)
+
+        assert [n for k, n in log if k == "flush"] == list(range(1, 51))
+
+    def test_document_smaller_than_one_chunk_opens_once(self, monkeypatch):
+        from pipeline import ocr
+
+        opens = []
+        monkeypatch.setattr(ocr.pdfplumber, "open",
+                            lambda p: (opens.append(p), _FakePdf(3, []))[1])
+        text = ocr._read_text_layer(Path("small.pdf"), 3, chunk_size=24)
+
+        assert len(opens) == 1
+        assert text.split("\n\n") == ["page 1", "page 2", "page 3"]
+
+    def test_extract_text_routes_a_usable_layer_through_the_batched_read(self, monkeypatch):
+        """The fast path must not fall back to holding the document open."""
+        from pipeline import ocr
+
+        seen = []
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(3, []))
+        monkeypatch.setattr(ocr.quality, "needs_ocr", lambda s: False)
+        monkeypatch.setattr(ocr, "_read_text_layer",
+                            lambda path, total, **kw: (seen.append(total), "BATCHED")[1])
+
+        text, used_ocr = ocr.extract_text(Path("doc.pdf"))
+        assert (text, used_ocr) == ("BATCHED", False)
+        assert seen == [3]
+
+
+# ---------------------------------------------------------------------------
 # Finding #1 — the translation guard
 # ---------------------------------------------------------------------------
 class TestTranslationGuard:
