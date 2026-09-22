@@ -255,7 +255,7 @@ file.
 ## Tests
 
 ```bash
-python -m pytest -q          # 53 tests, <1s
+python -m pytest -q          # 92 tests, ~15s
 ```
 
 They cover the guards that have to work: the OCR gate (including the exact
@@ -267,8 +267,31 @@ real llama3.2 refusal observed while building this).
 
 ## Current coverage
 
-Run `python run.py status` for live numbers. As of the last run: Chhattisgarh has
-45 PDFs crawled and 4 with extracted text; Bihar has 90 crawled and 0 processed.
-Odisha is configured (start URL `https://wcd.odisha.gov.in/`) but not yet crawled.
-Two states crawled, one partially searchable — treat the current index as a
-demo, not as coverage.
+Run `python run.py status` for live numbers. The crawl counts below come from
+each state's tracked `crawl_metadata.json`, so they are the repository's own
+record rather than an estimate:
+
+| State | Crawled | Text extracted |
+| --- | --- | --- |
+| Chhattisgarh | 45 | 4 |
+| Bihar | 90 | 0 |
+| Odisha | 497 | partial |
+| Delhi | 564 | partial (64 before a memory kill) |
+| Uttar Pradesh | 66 | 66 — complete |
+
+**All five states are crawled.** An earlier version of this section said Odisha
+was configured but not yet crawled; the tracked metadata had already outgrown
+that claim, which is exactly the kind of drift this section is supposed to
+prevent.
+
+Text extraction (`run.py ocr`) is the long pole and is CPU-bound — dense Hindi
+pages cost tens of seconds each — so those counts move slowly and are not
+tracked here: `processed_docs.json` is regenerable output and gitignored, which
+means the figures depend on the machine you are on. Delhi's run was killed by
+the OOM killer at document 64 of 563 on a box with under 1 GB of RAM; text-layer
+extraction is now batched so peak memory is bounded by the batch rather than the
+page count, and `run_ocr_priority.sh` retries a state that dies instead of
+leaving it silently stranded.
+
+Indexing and search work end to end, but the index currently covers a small
+fraction of the corpus — treat it as a demo, not as coverage.
