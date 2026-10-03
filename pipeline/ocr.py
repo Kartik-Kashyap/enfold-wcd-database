@@ -22,6 +22,17 @@ use forward slashes relative to the repo root.
 Kept from the original, because it was right: page-chunked rasterisation with
 ``del images`` + ``gc.collect()`` between chunks, which is what lets this handle
 a 500-page PDF, and resume-on-restart.
+
+Batching the pdfplumber read (above) bounds peak memory by chunk size for an
+*average* PDF, but a large scanned-looking booklet still peaks in the hundreds
+of MB per ``pdfplumber.open()`` regardless of how small the chunk is -- the
+cost is pdfminer decoding the embedded images each page holds, not the number
+of pages resident at once. Above ``TEXT_LAYER_PDFTOTEXT_MB`` the text layer is
+read with poppler's ``pdftotext`` in a subprocess instead: it walks the same
+xref without pulling any decoded image data into this process, so a 46 MB
+booklet costs a pipe buffer here rather than proportional resident memory.
+Smaller PDFs keep the pdfplumber path, which reads embedded fonts/layout
+pdftotext sometimes gets wrong on typeset text.
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ from __future__ import annotations
 import gc
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import pdfplumber
@@ -45,6 +57,21 @@ OCR_DPI = 150
 # chunk because extraction is far cheaper per page than rasterising, but still
 # bounded on purpose -- see _read_text_layer for why the bound matters.
 TEXT_CHUNK_PAGES = 24
+# File-size threshold, in MB, above which the text layer is read with the
+# pdftotext subprocess instead of pdfplumber -- see the module docstring.
+# Overridable per-run via the same-named environment variable, so a
+# memory-constrained box can lower it without a code change.
+TEXT_LAYER_PDFTOTEXT_MB = 10
+# Wall-clock budget for a single pdftotext/pdfinfo subprocess call.
+PDFTOTEXT_TIMEOUT = 120
+
+
+def _pdftotext_threshold_mb() -> float:
+    """Read ``TEXT_LAYER_PDFTOTEXT_MB`` at call time, falling back to the default."""
+    try:
+        return float(os.environ.get("TEXT_LAYER_PDFTOTEXT_MB", TEXT_LAYER_PDFTOTEXT_MB))
+    except ValueError:
+        return TEXT_LAYER_PDFTOTEXT_MB
 # Fallback when no state resolves an explicit language set; the default
 # StateConfig.ocr_langs is the same.  Odisha opts into 'ori' via its state entry.
 OCR_LANGS = "hin+eng"
@@ -128,6 +155,55 @@ def _read_text_layer(pdf_path: Path, total_pages: int,
     return "\n\n".join(parts)
 
 
+def _pdftotext_page_count(pdf_path: Path) -> int:
+    """Page count via ``pdfinfo``, without loading the document into Python."""
+    result = subprocess.run(
+        ["pdfinfo", str(pdf_path)],
+        capture_output=True, text=True, timeout=PDFTOTEXT_TIMEOUT, check=True,
+    )
+    for line in result.stdout.splitlines():
+        if line.startswith("Pages:"):
+            return int(line.split(":", 1)[1].strip())
+    raise ValueError("pdfinfo output had no 'Pages:' line")
+
+
+def _pdftotext_range(pdf_path: Path, first: int, last: int) -> list[str]:
+    """Per-page text for pages ``[first, last]`` (1-indexed, inclusive).
+
+    ``pdftotext`` separates pages with a form-feed character; splitting on it
+    gives the same one-string-per-page shape ``_read_text_layer`` builds from
+    pdfplumber, so the two paths are interchangeable to their caller.
+    """
+    result = subprocess.run(
+        ["pdftotext", "-enc", "UTF-8", "-f", str(first), "-l", str(last), str(pdf_path), "-"],
+        capture_output=True, timeout=PDFTOTEXT_TIMEOUT, check=True,
+    )
+    pages = result.stdout.decode("utf-8", errors="replace").split("\x0c")
+    # pdftotext trails the last page in the range with a form feed too, which
+    # leaves an empty string after the split -- not a blank page, drop it.
+    if pages and pages[-1] == "":
+        pages = pages[:-1]
+    return pages
+
+
+def _read_text_layer_pdftotext(pdf_path: Path, total_pages: int,
+                               chunk_size: int = TEXT_CHUNK_PAGES) -> str:
+    """Read the embedded text layer via the ``pdftotext`` subprocess.
+
+    Chunked the same way as :func:`_read_text_layer` -- one subprocess call
+    per range rather than one for the whole document -- so a page range large
+    enough to matter still bounds how much text sits in memory here at once.
+    """
+    parts: list[str] = []
+    for start in range(1, total_pages + 1, chunk_size):
+        end = min(start + chunk_size - 1, total_pages)
+        for page_text in _pdftotext_range(pdf_path, start, end):
+            text = page_text.strip()
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts)
+
+
 def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES,
                  lang: str = OCR_LANGS) -> tuple[str, bool]:
     """Return ``(text, was_ocr_used)`` for one PDF."""
@@ -135,39 +211,60 @@ def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES,
     parts: list[str] = []
     force_ocr = False
     total_pages = 0
+    sample = ""
 
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            total_pages = len(pdf.pages)
-            sample = ""
-            for page in pdf.pages[:SAMPLE_PAGES]:
-                sample += page.extract_text() or ""
+    size_mb = pdf_path.stat().st_size / (1024 * 1024) if pdf_path.exists() else 0.0
+    use_pdftotext = size_mb > _pdftotext_threshold_mb()
 
-            if quality.needs_ocr(sample):
-                if not sample.strip():
-                    reason = "no text layer (scanned image)"
-                elif quality.looks_like_legacy_font(sample):
-                    reason = "legacy font garble (Kruti Dev)"
-                elif len(sample.strip()) < 100:
-                    reason = "text layer too sparse"
-                else:
-                    reason = "text layer not readable"
-                print(f"    [OCR needed: {reason}] rasterising at {OCR_DPI} DPI...")
-                force_ocr = True
-            else:
-                # Fast path -- this is the branch the old heuristic made unreachable.
-                layer = ("Unicode Indic"
-                         if (quality.DEVANAGARI_RE.search(sample) or quality.ODIA_RE.search(sample))
-                         else "readable Latin")
-                print(f"    [usable text layer: {layer}] using pdfplumber, skipping OCR")
-    except Exception as exc:
-        print(f"    [pdfplumber failed: {exc}] falling back to OCR")
-        force_ocr = True
+    if use_pdftotext:
+        try:
+            total_pages = _pdftotext_page_count(pdf_path)
+            sample = "\n".join(_pdftotext_range(pdf_path, 1, min(SAMPLE_PAGES, total_pages) or 1))
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError, ValueError) as exc:
+            print(f"    [pdftotext unavailable for {pdf_path.name}: {exc}] falling back to pdfplumber")
+            use_pdftotext = False
+            total_pages = 0
 
-    # Deliberately outside the `with`: the handle above is released first, so
-    # the batched read below is the only thing holding the document open.  A
-    # large PDF pinned by both would defeat the batching.
+    if not use_pdftotext:
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+                sample = ""
+                for page in pdf.pages[:SAMPLE_PAGES]:
+                    sample += page.extract_text() or ""
+        except Exception as exc:
+            print(f"    [pdfplumber failed: {exc}] falling back to OCR")
+            force_ocr = True
+
     if not force_ocr:
+        if quality.needs_ocr(sample):
+            if not sample.strip():
+                reason = "no text layer (scanned image)"
+            elif quality.looks_like_legacy_font(sample):
+                reason = "legacy font garble (Kruti Dev)"
+            elif len(sample.strip()) < 100:
+                reason = "text layer too sparse"
+            else:
+                reason = "text layer not readable"
+            print(f"    [OCR needed: {reason}] rasterising at {OCR_DPI} DPI...")
+            force_ocr = True
+        else:
+            # Fast path -- this is the branch the old heuristic made unreachable.
+            layer = ("Unicode Indic"
+                     if (quality.DEVANAGARI_RE.search(sample) or quality.ODIA_RE.search(sample))
+                     else "readable Latin")
+            reader = "pdftotext" if use_pdftotext else "pdfplumber"
+            print(f"    [usable text layer: {layer}] using {reader}, skipping OCR")
+
+    # Deliberately outside the `with`/subprocess above: the handle is released
+    # first, so the batched read below is the only thing holding the document
+    # open.  A large PDF pinned by both would defeat the batching.
+    if not force_ocr:
+        if use_pdftotext:
+            try:
+                return _read_text_layer_pdftotext(pdf_path, total_pages), False
+            except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+                print(f"    [pdftotext failed for {pdf_path.name}: {exc}] falling back to pdfplumber")
         return _read_text_layer(pdf_path, total_pages), False
 
     if total_pages == 0:

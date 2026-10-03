@@ -249,6 +249,141 @@ class TestBatchedTextLayer:
         assert seen == [3]
 
 
+class TestPdftotextTextLayer:
+    """Large PDFs skip pdfplumber's text-layer read entirely.
+
+    A 46 MB Delhi booklet peaked at ~875 MB resident even with the batched
+    pdfplumber read above, because the cost is pdfminer decoding embedded
+    images per ``pdfplumber.open()``, not the number of pages held at once.
+    Above ``TEXT_LAYER_PDFTOTEXT_MB`` the text layer comes from the
+    ``pdftotext`` subprocess instead, which never loads image data into this
+    process.
+    """
+
+    @staticmethod
+    def _make_pdf(tmp_path, size_mb, name="doc.pdf"):
+        p = tmp_path / name
+        p.write_bytes(b"0" * int(size_mb * 1024 * 1024))
+        return p
+
+    def test_large_pdf_routes_to_pdftotext(self, tmp_path, monkeypatch):
+        from pipeline import ocr
+
+        pdf_path = self._make_pdf(tmp_path, 12)
+        seen = []
+        monkeypatch.setattr(ocr, "_pdftotext_page_count", lambda p: 5)
+        monkeypatch.setattr(ocr, "_pdftotext_range", lambda p, f, l: ["sample text " * 30])
+        monkeypatch.setattr(ocr.quality, "needs_ocr", lambda s: False)
+        monkeypatch.setattr(ocr, "_read_text_layer_pdftotext",
+                            lambda path, total, **kw: (seen.append(total), "PDFTOTEXT")[1])
+        monkeypatch.setattr(ocr.pdfplumber, "open",
+                            lambda p: (_ for _ in ()).throw(
+                                AssertionError("pdfplumber must not open a large PDF")))
+
+        text, used_ocr = ocr.extract_text(pdf_path)
+        assert (text, used_ocr) == ("PDFTOTEXT", False)
+        assert seen == [5]
+
+    def test_small_pdf_keeps_pdfplumber(self, tmp_path, monkeypatch):
+        from pipeline import ocr
+
+        pdf_path = self._make_pdf(tmp_path, 1)
+        calls = []
+        monkeypatch.setattr(ocr, "_pdftotext_page_count", lambda p: calls.append("called") or 5)
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(3, []))
+        monkeypatch.setattr(ocr.quality, "needs_ocr", lambda s: False)
+        monkeypatch.setattr(ocr, "_read_text_layer", lambda path, total, **kw: "PDFPLUMBER")
+
+        text, used_ocr = ocr.extract_text(pdf_path)
+        assert (text, used_ocr) == ("PDFPLUMBER", False)
+        assert calls == [], "pdftotext must not run below the threshold"
+
+    def test_env_override_lowers_the_threshold(self, tmp_path, monkeypatch):
+        from pipeline import ocr
+
+        pdf_path = self._make_pdf(tmp_path, 1)  # below the default 10 MB
+        monkeypatch.setenv("TEXT_LAYER_PDFTOTEXT_MB", "0.5")
+        monkeypatch.setattr(ocr, "_pdftotext_page_count", lambda p: 2)
+        monkeypatch.setattr(ocr, "_pdftotext_range", lambda p, f, l: ["text"])
+        monkeypatch.setattr(ocr.quality, "needs_ocr", lambda s: False)
+        monkeypatch.setattr(ocr, "_read_text_layer_pdftotext", lambda path, total, **kw: "PDFTOTEXT")
+        monkeypatch.setattr(ocr.pdfplumber, "open",
+                            lambda p: (_ for _ in ()).throw(
+                                AssertionError("threshold override should skip pdfplumber")))
+
+        text, used_ocr = ocr.extract_text(pdf_path)
+        assert (text, used_ocr) == ("PDFTOTEXT", False)
+
+    def test_missing_pdftotext_falls_back_to_pdfplumber(self, tmp_path, monkeypatch):
+        """A missing/broken pdftotext must not lose the document."""
+        from pipeline import ocr
+
+        pdf_path = self._make_pdf(tmp_path, 12)
+
+        def boom(p):
+            raise FileNotFoundError("pdftotext not found")
+
+        monkeypatch.setattr(ocr, "_pdftotext_page_count", boom)
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(3, []))
+        monkeypatch.setattr(ocr.quality, "needs_ocr", lambda s: False)
+        monkeypatch.setattr(ocr, "_read_text_layer", lambda path, total, **kw: "PDFPLUMBER")
+
+        text, used_ocr = ocr.extract_text(pdf_path)
+        assert (text, used_ocr) == ("PDFPLUMBER", False)
+
+    def test_pdftotext_read_failure_falls_back_to_pdfplumber(self, tmp_path, monkeypatch):
+        """pdftotext resolves the sample fine but the full read then fails."""
+        from pipeline import ocr
+        import subprocess
+
+        pdf_path = self._make_pdf(tmp_path, 12)
+        monkeypatch.setattr(ocr, "_pdftotext_page_count", lambda p: 5)
+        monkeypatch.setattr(ocr, "_pdftotext_range", lambda p, f, l: ["sample text " * 30])
+        monkeypatch.setattr(ocr.quality, "needs_ocr", lambda s: False)
+
+        def boom(path, total, **kw):
+            raise subprocess.CalledProcessError(1, "pdftotext")
+
+        monkeypatch.setattr(ocr, "_read_text_layer_pdftotext", boom)
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(5, []))
+        monkeypatch.setattr(ocr, "_read_text_layer", lambda path, total, **kw: "PDFPLUMBER")
+
+        text, used_ocr = ocr.extract_text(pdf_path)
+        assert (text, used_ocr) == ("PDFPLUMBER", False)
+
+    def test_pdftotext_range_splits_on_form_feed(self):
+        """Page-shape parity with pdfplumber: one string per page, no phantom
+        trailing page from the form feed after the last one in the range."""
+        from pipeline import ocr
+
+        class FakeResult:
+            stdout = "page one\x0cpage two\x0c".encode("utf-8")
+
+        ocr_subprocess_run = ocr.subprocess.run
+        try:
+            ocr.subprocess.run = lambda *a, **kw: FakeResult()
+            pages = ocr._pdftotext_range(Path("doc.pdf"), 1, 2)
+        finally:
+            ocr.subprocess.run = ocr_subprocess_run
+        assert pages == ["page one", "page two"]
+
+    def test_read_text_layer_pdftotext_chunks_like_the_pdfplumber_batching(self, monkeypatch):
+        """Same page-range chunking contract as ``_read_text_layer``."""
+        from pipeline import ocr
+
+        calls = []
+
+        def fake_range(path, first, last):
+            calls.append((first, last))
+            return [f"page {p}" for p in range(first, last + 1)]
+
+        monkeypatch.setattr(ocr, "_pdftotext_range", fake_range)
+        text = ocr._read_text_layer_pdftotext(Path("big.pdf"), 50, chunk_size=24)
+
+        assert calls == [(1, 24), (25, 48), (49, 50)], "50 pages at 24/chunk is 24 + 24 + 2"
+        assert text.split("\n\n") == [f"page {i}" for i in range(1, 51)]
+
+
 # ---------------------------------------------------------------------------
 # Finding #1 — the translation guard
 # ---------------------------------------------------------------------------
