@@ -38,7 +38,7 @@ mkdir -p logs
 # that failed to start, a half-written file) reads as 0 -- the guard must never
 # spin on a number it could not read.
 processed_count() {
-  local f="scraper/$1/processed_docs.json" n
+  local f="$1/processed_docs.json" n
   [ -f "$f" ] || { echo 0; return; }
   n=$("$PY" -c 'import json, sys
 try:
