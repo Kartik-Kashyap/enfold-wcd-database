@@ -220,7 +220,8 @@ def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES,
         try:
             total_pages = _pdftotext_page_count(pdf_path)
             sample = "\n".join(_pdftotext_range(pdf_path, 1, min(SAMPLE_PAGES, total_pages) or 1))
-        except (subprocess.CalledProcessError, FileNotFoundError, OSError, ValueError) as exc:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                FileNotFoundError, OSError, ValueError) as exc:
             print(f"    [pdftotext unavailable for {pdf_path.name}: {exc}] falling back to pdfplumber")
             use_pdftotext = False
             total_pages = 0
@@ -263,7 +264,8 @@ def extract_text(pdf_path: Path | str, chunk_size: int = RASTER_CHUNK_PAGES,
         if use_pdftotext:
             try:
                 return _read_text_layer_pdftotext(pdf_path, total_pages), False
-            except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                    FileNotFoundError, OSError) as exc:
                 print(f"    [pdftotext failed for {pdf_path.name}: {exc}] falling back to pdfplumber")
         return _read_text_layer(pdf_path, total_pages), False
 

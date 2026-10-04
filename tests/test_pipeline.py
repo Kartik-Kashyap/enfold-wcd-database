@@ -351,6 +351,51 @@ class TestPdftotextTextLayer:
         text, used_ocr = ocr.extract_text(pdf_path)
         assert (text, used_ocr) == ("PDFPLUMBER", False)
 
+    def test_pdftotext_timeout_while_sampling_falls_back(self, tmp_path, monkeypatch):
+        """A hung pdftotext must fall back, not take the whole run down.
+
+        ``TimeoutExpired`` is a sibling of ``CalledProcessError`` under
+        ``SubprocessError`` -- it is not a subclass of it, nor of ``OSError``
+        -- so an ``except`` clause listing those two misses it entirely and
+        the timeout escapes ``extract_text``.  On a memory-starved box that
+        is the difference between one slow document and a dead state run.
+        """
+        from pipeline import ocr
+        import subprocess
+
+        pdf_path = self._make_pdf(tmp_path, 12)
+
+        def hang(p):
+            raise subprocess.TimeoutExpired(cmd="pdfinfo", timeout=120)
+
+        monkeypatch.setattr(ocr, "_pdftotext_page_count", hang)
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(3, []))
+        monkeypatch.setattr(ocr.quality, "needs_ocr", lambda s: False)
+        monkeypatch.setattr(ocr, "_read_text_layer", lambda path, total, **kw: "PDFPLUMBER")
+
+        text, used_ocr = ocr.extract_text(pdf_path)
+        assert (text, used_ocr) == ("PDFPLUMBER", False)
+
+    def test_pdftotext_timeout_while_reading_falls_back(self, tmp_path, monkeypatch):
+        """Sampling succeeds, then the full read exceeds the timeout."""
+        from pipeline import ocr
+        import subprocess
+
+        pdf_path = self._make_pdf(tmp_path, 12)
+        monkeypatch.setattr(ocr, "_pdftotext_page_count", lambda p: 5)
+        monkeypatch.setattr(ocr, "_pdftotext_range", lambda p, f, l: ["sample text " * 30])
+        monkeypatch.setattr(ocr.quality, "needs_ocr", lambda s: False)
+
+        def hang(path, total, **kw):
+            raise subprocess.TimeoutExpired(cmd="pdftotext", timeout=120)
+
+        monkeypatch.setattr(ocr, "_read_text_layer_pdftotext", hang)
+        monkeypatch.setattr(ocr.pdfplumber, "open", lambda p: _FakePdf(5, []))
+        monkeypatch.setattr(ocr, "_read_text_layer", lambda path, total, **kw: "PDFPLUMBER")
+
+        text, used_ocr = ocr.extract_text(pdf_path)
+        assert (text, used_ocr) == ("PDFPLUMBER", False)
+
     def test_pdftotext_range_splits_on_form_feed(self):
         """Page-shape parity with pdfplumber: one string per page, no phantom
         trailing page from the form feed after the last one in the range."""
