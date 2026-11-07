@@ -149,7 +149,16 @@ def index_states(states: list[StateConfig], db_path: Path | None = None,
                     "hi_start": start,
                     "hi_end": end,
                     "was_ocr_used": bool(doc.get("was_ocr_used", False)),
-                    "language": "hi",
+                    # The documents' own language, from the state registry: the
+                    # corpus is no longer Hindi-only now that Karnataka's
+                    # Kannada documents are indexed alongside it.
+                    "language": state.language_code,
+                    # Portal-published fields, present for states whose crawl
+                    # captured a listing table (Karnataka).  Empty strings for
+                    # everyone else, so no filter ever has to special-case them.
+                    "subject": doc.get("subject", "") or "",
+                    "order_no": doc.get("order_no", "") or "",
+                    "source_org": doc.get("source_org", "") or "",
                 }
                 epoch = dates.date_epoch(doc_date)
                 if epoch is not None:

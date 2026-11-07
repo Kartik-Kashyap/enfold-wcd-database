@@ -31,6 +31,7 @@ from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
+from requests import certs as requests_certs
 
 from . import dates, jsonio, paths
 from .states import StateConfig
@@ -73,23 +74,74 @@ def build_user_agent() -> str:
     return f"EnfoldChildRightsCrawler/1.0 (+{PROJECT_URL}{suffix})"
 
 
+def verify_for(state: StateConfig) -> bool | str:
+    """The ``verify=`` argument to use for this state's requests.
+
+    ``True`` -- the requests default, verify against the standard trust store --
+    for every state whose portal presents a complete TLS chain, which is all of
+    them but Karnataka.
+
+    Karnataka's portal renewed its leaf certificate onto GlobalSign's newer R46
+    intermediate but still serves the *previous* intermediate in its handshake,
+    so the chain it sends cannot be verified by anyone: ``requests`` raises
+    ``CERTIFICATE_VERIFY_FAILED`` and ``curl`` exits 60.  Browsers appear to work
+    only because they chase the certificate's AIA extension and cache the
+    missing intermediate themselves.  A state that names an ``extra_ca`` file
+    (``pipeline/certs/``) gets the same treatment: that certificate is written
+    alongside the standard roots into a combined bundle, and the handshake is
+    then verified normally.
+
+    Appending a certificate only ever *adds* a trusted intermediate.  Nothing is
+    skipped: a chain that does not reach a real, already-trusted root still
+    fails, so this is not the same as ``verify=False``.  The alternative --
+    disabling verification for the whole portal -- would leave the corpus open
+    to a forged certificate and a tampered document.
+    """
+    if not state.extra_ca:
+        return True
+
+    extra = paths.CERTS_DIR / state.extra_ca
+    if not extra.exists():
+        print(f"  [tls] {state.key}: {state.extra_ca} is not in {paths.CERTS_DIR} -- "
+              f"using the default trust store; requests will fail if this portal's "
+              f"chain is still incomplete")
+        return True
+
+    combined = paths.CA_BUNDLE_CACHE / f"{state.key}.pem"
+    # Rebuild when absent, or when the vendored certificate has been replaced.
+    if not combined.exists() or combined.stat().st_mtime < extra.stat().st_mtime:
+        paths.CA_BUNDLE_CACHE.mkdir(parents=True, exist_ok=True)
+        base = Path(requests_certs.where()).read_bytes().rstrip() + b"\n"
+        combined.write_bytes(base + extra.read_bytes())
+        print(f"  [tls] {state.key}: trust store = default roots + {state.extra_ca}")
+    return str(combined)
+
+
 def determine_category(url: str, page_title: str, link_text: str) -> str:
     """Infer document category from URL, page heading, or link text.
 
-    Checks English and Devanagari keywords side by side -- kept as-is from the
-    original, which got this right.
+    Checks English, Devanagari and Kannada keywords side by side -- the first two
+    are kept as-is from the original, which got them right.  Kannada is needed
+    because Karnataka's own link text is just "Download"; the signal comes from
+    the table's subject cell, which the caller passes in as ``link_text`` once it
+    has been captured (see :func:`parse_listing_row`).
     """
     combined = f"{url} {page_title} {link_text}".lower()
 
-    if any(k in combined for k in ["act", "अधिनियम", "rules", "नियम"]):
+    if any(k in combined for k in ["act", "अधिनियम", "rules", "नियम",
+                                   "ಅಧಿನಿಯಮ", "ಕಾಯ್ದೆ", "ನಿಯಮ"]):
         return "Acts & Rules"
-    if any(k in combined for k in ["circular", "परिपत्र", "notification", "अधिसूचना", "order", "आदेश"]):
+    if any(k in combined for k in ["circular", "परिपत्र", "notification", "अधिसूचना", "order", "आदेश",
+                                   "ಸುತ್ತೋಲೆ", "ಪರಿಪತ್ರ", "ಅಧಿಸೂಚನೆ", "ಆದೇಶ"]):
         return "Circulars & Orders"
-    if any(k in combined for k in ["scheme", "योजना", "program", "programme"]):
+    if any(k in combined for k in ["scheme", "योजना", "program", "programme",
+                                   "ಯೋಜನೆ", "ಕಾರ್ಯಕ್ರಮ"]):
         return "Schemes & Programs"
-    if any(k in combined for k in ["sop", "guideline", "दिशा-निर्देश", "disha-nirdesh"]):
+    if any(k in combined for k in ["sop", "guideline", "दिशा-निर्देश", "disha-nirdesh",
+                                   "ಮಾರ್ಗಸೂಚಿ", "ನಿರ್ದೇಶನ"]):
         return "SOPs & Guidelines"
-    if any(k in combined for k in ["report", "प्रतिवेदन", "annual"]):
+    if any(k in combined for k in ["report", "प्रतिवेदन", "annual",
+                                   "ವರದಿ", "ವಾರ್ಷಿಕ"]):
         return "Reports"
     return "General / Uncategorized"
 
@@ -99,6 +151,142 @@ def sanitize_filename(text: str, fallback_index: int) -> str:
     ascii_only = re.sub(r"[^\x00-\x7F]+", "", clean).strip()
     ascii_only = re.sub(r"\s+", "_", ascii_only)
     return ascii_only[:50] if ascii_only else f"document_{fallback_index}"
+
+
+def filename_from_url(url: str, fallback_index: int, taken: set[str] | None = None) -> str:
+    """Name a PDF from its URL's basename rather than its link text.
+
+    Karnataka links every document through ``<a>Download</a>`` pointing at
+    ``uploads/media_to_upload<id>.pdf``, so link-text naming would produce
+    ``Download_1.pdf``, ``Download_2.pdf``, ... -- names that carry no
+    information and would collide the moment the crawl order changed.  The URL
+    basename is unique per document and stable across re-crawls, which also
+    keeps the resume logic honest.  Falls back to the ``document_<n>``
+    convention when a URL has no usable basename; ``taken`` disambiguates two
+    URLs that happen to share one.
+    """
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", Path(urlparse(url).path).name).strip("._-")
+    if stem.lower().endswith(".pdf"):
+        stem = stem[:-4]
+    if not stem:
+        return f"document_{fallback_index}.pdf"
+    candidate = f"{stem}.pdf"
+    if taken and candidate in taken:
+        candidate = f"{stem}_{fallback_index}.pdf"
+    return candidate
+
+
+# Karnataka's listing tables label their columns in Kannada.  Each header cell is
+# matched to the field it carries, so the mapping is driven by the table's own
+# header row and not by column position: a table that gains, loses or reorders a
+# column then degrades to "field missing" rather than to "field silently wrong".
+_LISTING_COLUMNS = (
+    ("ವಿಷಯ", "subject"),          # subject / title of the order
+    ("ದಿನಾಂಕ", "order"),          # "ಆದೇಶ ಸಂಖ್ಯೆ / ದಿನಾಂಕ" -- order number + date
+    ("ಮೂಲ", "source_org"),        # originating body, e.g. ಇಲಾಖೆ (department)
+    ("ಮಾಧ್ಯಮ", "medium"),         # language of the document, e.g. ಕನ್ನಡ
+    ("ಗಾತ್ರ", "size_reported"),   # portal-reported size (often boilerplate)
+)
+
+# A trailing dd.mm.yyyy / dd-mm-yyyy / dd/mm/yyyy at the end of the order cell,
+# which is where the issue date sits: "ಮಮಇ 293 ಮಮಅ 2005, 05.05.2007".
+_TRAILING_DATE_RE = re.compile(r"[,;]?\s*\d{1,2}[/.\-]\d{1,2}[/.\-]\d{4}\s*$")
+# Some rows label the date inline -- "ಮಮಇ 81 ಮಮಅ 2025, ದಿನಾಂಕ:04.04.2025" -- which
+# leaves the bare label behind once the date is stripped.
+_ORDER_LABEL_RE = re.compile(r"[,;]?\s*ದಿನಾಂಕ\s*[:ः]?\s*$")
+
+
+def _cell_text(cell) -> str:
+    """Visible text of a table cell, collapsed to single spaces."""
+    return re.sub(r"\s+", " ", cell.get_text(" ", strip=True)).strip()
+
+
+def listing_headers(table, data_row=None) -> list[str | None]:
+    """Map a listing table's columns to canonical field names, from its header.
+
+    A row only counts as a header if it looks like one -- a ``<th>`` row, or a
+    first row carrying ``<strong>`` cells -- *and* it has at least two cells.
+    When the caller passes the row it is reading, the header must also not be
+    wider than that row, since the mapping is positional.
+
+    That guard is not hypothetical (wcd /84/gradation-lists.../kn).  The table
+    there opens with a single caption cell spanning all five columns::
+
+        ಮಹಿಳಾ ಮತ್ತು ಮಕ್ಕಳ ಅಭಿವೃದ್ದಿ ... ವಿವಿಧ ವೃಂದಗಳ ದಿನಾಂಕ:01.01.2025ರಲ್ಲಿದ್ದಂತೆ
+        ಜ್ಯೇಷ್ಠತಾ ಪಟ್ಟಿಗಳು.
+
+    Its text contains the ದಿನಾಂಕ marker, so reading it as a header maps column 0
+    to ``order`` -- and every row's *serial number* is then captured as its
+    government order number.  A column we fail to read is recoverable later; a
+    column we read wrongly is not, so an unrecognisable table yields nothing.
+    """
+    header_row = None
+    for row in table.find_all("tr"):
+        if row.find("th"):
+            header_row = row
+            break
+    if header_row is None:
+        # Some portals style the header as a plain first row of <td><strong>.
+        first = table.find("tr")
+        if first is not None and first.find("strong"):
+            header_row = first
+    if header_row is None:
+        return []
+
+    cells = header_row.find_all(["th", "td"])
+    # One cell means a caption spanning the table, not a header.
+    if len(cells) < 2:
+        return []
+    if data_row is not None and len(cells) > len(data_row.find_all(["td", "th"])):
+        return []
+    return [
+        next((field for marker, field in _LISTING_COLUMNS if marker in _cell_text(cell)), None)
+        for cell in cells
+    ]
+
+
+def parse_listing_row(link) -> dict:
+    """Capture the listing-table row a PDF link sits in, if there is one.
+
+    Returns canonical fields (``subject``, ``order_no``, ``table_date``,
+    ``source_org``, ``medium``, ``size_reported``), or ``{}`` when the link is
+    not inside a table we recognise.  Nothing is guessed: a column is read only
+    when the table's own header names it.
+
+    The issue date is the real prize.  It comes from the portal's structured
+    markup rather than from OCR, so it is available for scanned documents that
+    have no text layer at all.
+    """
+    row = link.find_parent("tr")
+    table = row.find_parent("table") if row is not None else None
+    if row is None or table is None:
+        return {}
+    columns = listing_headers(table, row)
+    if not columns:
+        return {}
+
+    cells: dict[str, str] = {}
+    for field, cell in zip(columns, row.find_all(["td", "th"])):
+        text = _cell_text(cell)
+        if field and text:
+            cells[field] = text
+
+    captured: dict[str, str] = {
+        field: cells[field]
+        for field in ("subject", "source_org", "medium", "size_reported")
+        if field in cells
+    }
+    if "order" in cells:
+        order_text = cells["order"]
+        # The order number is the cell minus its trailing date and date label.
+        order_no = _TRAILING_DATE_RE.sub("", order_text)
+        order_no = _ORDER_LABEL_RE.sub("", order_no).strip(" ,;:")
+        if order_no:
+            captured["order_no"] = order_no
+        iso = dates.extract_date(order_text)
+        if iso:
+            captured["table_date"] = iso
+    return captured
 
 
 class Politeness:
@@ -174,6 +362,7 @@ def crawl_state(
     user_agent = build_user_agent()
     headers = {"User-Agent": user_agent, "Accept": "text/html,application/pdf,*/*"}
     police = Politeness(user_agent, delay=delay, obey_robots=obey_robots)
+    verify = verify_for(state)
 
     print(f"\n=== Crawling {state.name} ===")
     print(f"  start:      {state.start_url}")
@@ -183,6 +372,13 @@ def crawl_state(
     metadata: list[dict] = jsonio.read_json(state.crawl_metadata, default=[]) or []
     seen_pdf_urls = {m.get("pdf_url") for m in metadata if m.get("pdf_url")}
     file_index = _next_file_index(metadata)
+    # URL-named states need to know which names are already spent, so a re-crawl
+    # (or two URLs sharing a basename) cannot silently overwrite a stored PDF.
+    taken_names: set[str] = set()
+    if state.filename_from_url:
+        taken_names = {m.get("filename") for m in metadata if m.get("filename")}
+        if state.pdf_dir.exists():
+            taken_names |= {p.name for p in state.pdf_dir.iterdir() if p.suffix.lower() == ".pdf"}
     print(f"  resuming:   {len(metadata)} PDFs already recorded")
 
     visited: set[str] = set()
@@ -192,8 +388,9 @@ def crawl_state(
 
     with jsonio.BatchedJsonWriter(state.crawl_metadata, existing=metadata, flush_every=5) as writer:
         def record(url: str, source: str, link_text: str, filename: str,
-                   category: str, target: Path) -> None:
-            writer.add({
+                   category: str, target: Path, table_meta: dict | None = None) -> None:
+            table_meta = table_meta or {}
+            entry = {
                 "filename": filename,
                 # Stored with forward slashes, relative to the repo root
                 # (review finding #3) so it resolves on any OS.
@@ -204,13 +401,20 @@ def crawl_state(
                 "state_key": state.key,
                 "category": category,
                 "link_text": link_text,
-                # The document's own issue date, best-effort from the PDF's text
-                # layer (no OCR at crawl time).  Scanned PDFs get their date at
-                # the OCR stage instead.
-                "document_date": dates.extract_date_from_pdf(target),
+                # The document's own issue date.  A date read from the portal's
+                # listing table is authoritative and beats the best-effort read
+                # of the PDF's text layer -- and unlike that read it works for
+                # scanned documents that carry no text layer at all.
+                "document_date": table_meta.get("table_date")
+                                  or dates.extract_date_from_pdf(target),
                 # When we scraped it -- distinct from the document date.
                 "crawled_at": date.today().isoformat(),
-            })
+            }
+            # Only present for states whose portals publish a listing table
+            # (currently Karnataka); the five older states record exactly the
+            # keys they always did.
+            entry.update(table_meta)
+            writer.add(entry)
 
         while queue:
             current_url, depth, source_page, link_text = queue.pop(0)
@@ -229,7 +433,8 @@ def crawl_state(
             print(f"\n Scanning [{state.name}] [depth {depth}]: {current_url}")
             police.wait()
             try:
-                response = requests.get(current_url, headers=headers, timeout=12)
+                response = requests.get(current_url, headers=headers, timeout=12,
+                                        verify=verify)
                 # Status first, then Content-Type (review finding #13): an error
                 # page must never reach the parser downstream.
                 response.raise_for_status()
@@ -282,18 +487,30 @@ def crawl_state(
                         continue
                     seen_pdf_urls.add(absolute_url)
 
-                    link_text = link.text.strip() or "Untitled_Document"
-                    safe_name = sanitize_filename(link_text, file_index)
-                    filename = f"{safe_name}_{file_index}.pdf"
+                    anchor_text = link.text.strip() or "Untitled_Document"
+                    # Read the listing row *before* naming the file: where a table
+                    # exists its subject cell is what actually names the document,
+                    # while the anchor text is usually just "Download".  The
+                    # subject also gives category inference something to work with.
+                    table_meta = parse_listing_row(link) if state.capture_table_metadata else {}
+                    display_text = table_meta.get("subject") or anchor_text
+
+                    if state.filename_from_url:
+                        filename = filename_from_url(absolute_url, file_index, taken_names)
+                        taken_names.add(filename)
+                    else:
+                        safe_name = sanitize_filename(display_text, file_index)
+                        filename = f"{safe_name}_{file_index}.pdf"
                     file_index += 1
                     state.pdf_dir.mkdir(parents=True, exist_ok=True)
                     target = state.pdf_dir / filename
-                    category = determine_category(current_url, page_title, link_text)
+                    category = determine_category(current_url, page_title, display_text)
 
                     print(f"  [PDF] {category} | {filename}")
                     police.wait()
                     try:
-                        pdf_res = requests.get(absolute_url, headers=headers, stream=True, timeout=30)
+                        pdf_res = requests.get(absolute_url, headers=headers, stream=True,
+                                               timeout=30, verify=verify)
                         pdf_res.raise_for_status()
                         with target.open("wb") as f:
                             for chunk in pdf_res.iter_content(chunk_size=8192):
@@ -304,7 +521,8 @@ def crawl_state(
                         target.unlink(missing_ok=True)
                         continue
 
-                    record(absolute_url, current_url, link_text, filename, category, target)
+                    record(absolute_url, current_url, display_text, filename, category,
+                           target, table_meta)
                     new_downloads += 1
 
                 elif depth < max_depth:
@@ -334,6 +552,9 @@ def fetch_missing_pdfs(state: StateConfig, delay: float = DEFAULT_DELAY) -> tupl
     user_agent = build_user_agent()
     headers = {"User-Agent": user_agent}
     police = Politeness(user_agent, delay=delay)
+    # Built from the same config as the crawl, so a re-fetch of a portal with an
+    # incomplete chain (Karnataka) does not fail where the crawl succeeded.
+    verify = verify_for(state)
 
     metadata: list[dict] = jsonio.read_json(state.crawl_metadata, default=[]) or []
     if not metadata:
@@ -357,7 +578,7 @@ def fetch_missing_pdfs(state: StateConfig, delay: float = DEFAULT_DELAY) -> tupl
         print(f"  fetching {entry['filename']}")
         police.wait()
         try:
-            res = requests.get(url, headers=headers, stream=True, timeout=30)
+            res = requests.get(url, headers=headers, stream=True, timeout=30, verify=verify)
             res.raise_for_status()
             with target.open("wb") as f:
                 for chunk in res.iter_content(chunk_size=8192):

@@ -1,0 +1,108 @@
+.filter-sidebar {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  position: sticky;
+  top: 80px;
+  align-self: flex-start;
+  min-width: 220px;
+  max-width: 260px;
+}
+
+.filter-sidebar-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.filter-sidebar-icon {
+  font-size: 16px;
+}
+
+.filter-sidebar-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.filter-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.filter-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.filter-sublabel {
+  font-size: 12px;
+  color: var(--text-muted);
+  display: block;
+  margin-bottom: 4px;
+}
+
+.filter-select {
+  font-size: 13px;
+  padding: 9px 36px 9px 12px;
+}
+
+.filter-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.filter-checkbox-row input[type="checkbox"] {
+  accent-color: var(--brand-magenta);
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+}
+.filter-checkbox-row small {
+  color: var(--text-muted);
+}
+
+.date-range-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.date-range-inputs .input {
+  font-size: 13px;
+  padding: 8px 12px;
+}
+
+.filter-caption {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.filter-caption code {
+  font-size: 11px;
+  background: #F0EDE8;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.filter-reset {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+  align-self: flex-start;
+}

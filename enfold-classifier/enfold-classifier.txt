@@ -1,0 +1,112 @@
+<?php
+/**
+ * Plugin Name: Enfold Heinous Offence Classifier
+ * Description: Offence classifier tool with Google Sheets data sync.
+ * Version: 1.0.1
+ * Author: Enfold India
+ */
+
+if (!defined('ABSPATH')) exit;
+
+// 1. Add admin settings page for Data Sync
+add_action('admin_menu', 'enfold_classifier_menu');
+function enfold_classifier_menu() {
+    add_management_page(
+        'Classifier Sync',
+        'Classifier Sync',
+        'manage_options',
+        'enfold-classifier-sync',
+        'enfold_classifier_admin_view'
+    );
+}
+
+function enfold_classifier_admin_view() {
+    if (isset($_POST['save_sheet_url']) && check_admin_referer('enfold_save_nonce')) {
+        update_option('enfold_sheet_endpoint', esc_url_raw($_POST['sheet_endpoint']));
+        echo '<div class="notice notice-success is-dismissible"><p>Google Sheet Web App URL saved!</p></div>';
+    }
+
+    if (isset($_POST['trigger_sync']) && check_admin_referer('enfold_sync_nonce')) {
+        $result = enfold_sync_sheet_data();
+        if ($result) {
+            echo '<div class="notice notice-success is-dismissible"><p>Data synced successfully from Google Sheets!</p></div>';
+        } else {
+            echo '<div class="notice notice-error is-dismissible"><p>Failed to sync data. Check the URL or permissions.</p></div>';
+        }
+    }
+
+    $url = get_option('enfold_sheet_endpoint', '');
+    $last_updated = get_option('enfold_classifier_last_updated', 'Never');
+    $records = get_option('enfold_classifier_records', []);
+    $count = is_array($records) ? count($records) : 0;
+    ?>
+    <div class="wrap">
+        <h1>Heinous Offence Classifier — Sheet Sync</h1>
+        <div style="background:#fff; border:1px solid #ccd0d4; padding:15px; margin:20px 0; max-width:700px;">
+            <p><strong>Total Cached Offences:</strong> <?php echo esc_html($count); ?></p>
+            <p><strong>Last Updated:</strong> <?php echo esc_html($last_updated); ?></p>
+        </div>
+
+        <form method="post" style="margin-bottom:20px;">
+            <?php wp_nonce_field('enfold_save_nonce'); ?>
+            <table class="form-table">
+                <tr>
+                    <th scope="row"><label for="sheet_endpoint">Google Web App URL</label></th>
+                    <td>
+                        <input type="url" id="sheet_endpoint" name="sheet_endpoint" value="<?php echo esc_attr($url); ?>" class="regular-text" style="width:100%; max-width:500px;" required placeholder="https://script.google.com/macros/s/.../exec">
+                    </td>
+                </tr>
+            </table>
+            <input type="submit" name="save_sheet_url" class="button button-secondary" value="Save URL">
+        </form>
+
+        <form method="post">
+            <?php wp_nonce_field('enfold_sync_nonce'); ?>
+            <input type="submit" name="trigger_sync" class="button button-primary" value="Sync Real-Time Data Now">
+        </form>
+    </div>
+    <?php
+}
+
+// 2. Fetcher function to pull JSON from Apps Script
+function enfold_sync_sheet_data() {
+    $url = get_option('enfold_sheet_endpoint');
+    if (empty($url)) return false;
+
+    $response = wp_remote_get($url, ['timeout' => 30]);
+    if (is_wp_error($response)) return false;
+
+    $body = wp_remote_retrieve_body($response);
+    $data = json_decode($body, true);
+
+    if (is_array($data) && !empty($data)) {
+        update_option('enfold_classifier_records', $data, false); // Don't autoload large dataset on every page load
+        update_option('enfold_classifier_last_updated', current_time('mysql'));
+        return true;
+    }
+    return false;
+}
+
+// 3. Shortcode to display the tool on any page
+add_shortcode('heinous_offence_classifier', 'enfold_classifier_render_tool');
+function enfold_classifier_render_tool() {
+    $records = get_option('enfold_classifier_records', []);
+    $last_updated = get_option('enfold_classifier_last_updated', 'Recently');
+
+    ob_start();
+    ?>
+    <div id="enfold-classifier-container">
+        <!-- Centered alignment wrapper matching the header/app container -->
+        <div style="max-width: 1100px; margin: 0 auto 12px auto; padding: 0 15px; font-size: 12.5px; color: #6B6459;">
+            <strong>Database last updated:</strong> <?php echo esc_html($last_updated); ?>
+        </div>
+
+        <?php include plugin_dir_path(__FILE__) . 'template-view.php'; ?>
+    </div>
+
+    <script id="seed-data" type="application/json">
+        <?php echo wp_json_encode($records); ?>
+    </script>
+    <?php
+    return ob_get_clean();
+}

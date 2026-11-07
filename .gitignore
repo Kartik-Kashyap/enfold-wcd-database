@@ -31,8 +31,15 @@ translated_docs.json
 */processed_docs.json
 */translated_docs.json
 
+claude_handoff/
+
 # On-demand translation cache (machine-specific, rebuilds itself)
 translation_cache.json
+
+# Combined TLS trust stores, rebuilt from the standard roots + a vendored
+# intermediate in pipeline/certs/ (see crawler.verify_for). The certificates
+# themselves ARE tracked; this is only the generated concatenation.
+.cache/
 
 # NOTE: crawl_metadata.json is deliberately NOT ignored. It is small, it is the
 # record of what was crawled and from where, and it is what lets a fresh clone

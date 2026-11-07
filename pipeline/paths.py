@@ -27,6 +27,16 @@ TRANSLATION_CACHE = REPO_ROOT / "translation_cache.json"
 
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
+# Extra CA certificates, vendored per state, for portals that serve an
+# incomplete TLS chain (see pipeline/certs/globalsign-gcc-r46-ov-tls-ca-2025.pem).
+# Unlike everything else in this module these files ARE tracked in git -- a
+# vendored public CA certificate is small, and the crawl cannot run without it.
+CERTS_DIR = REPO_ROOT / "pipeline" / "certs"
+
+# Where the per-state combined trust stores get written (standard roots + the
+# vendored extra).  Regenerable on every run and git-ignored.
+CA_BUNDLE_CACHE = REPO_ROOT / ".cache" / "ca"
+
 
 def as_posix(path: Path | str) -> str:
     """Path -> string safe to store in JSON and re-read on any OS."""

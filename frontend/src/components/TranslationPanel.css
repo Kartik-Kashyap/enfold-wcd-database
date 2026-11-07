@@ -1,0 +1,38 @@
+.translation-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.translation-panel.loading {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-secondary);
+  font-size: 14px;
+  padding: 12px 0;
+}
+
+.translation-result {
+  font-size: 14px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.translation-caption {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.translation-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.translation-hint code {
+  background: #F0EDE8;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+}

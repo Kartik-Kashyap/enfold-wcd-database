@@ -123,6 +123,21 @@ def check_hindi_langpack() -> bool:
         return True  # can't tell; let the OCR call surface any real problem
 
 
+def missing_langpacks(langs: str) -> list[str]:
+    """Requested tesseract languages that are not installed on this machine.
+
+    A state whose documents need a pack the box does not carry -- Karnataka's
+    ``kan``, until someone with root installs ``tesseract-ocr-kan`` -- would
+    otherwise surface as a wall of per-page OCR failures.  Naming the missing
+    pack up front turns that into one actionable line.
+    """
+    try:
+        installed = set(pytesseract.get_languages(config=""))
+    except Exception:
+        return []  # can't tell; don't invent a warning
+    return [lang for lang in (langs or "").split("+") if lang and lang not in installed]
+
+
 def _read_text_layer(pdf_path: Path, total_pages: int,
                      chunk_size: int = TEXT_CHUNK_PAGES) -> str:
     """Read the embedded text layer in page batches, reopening per batch.
@@ -330,6 +345,14 @@ def process_state(state: StateConfig, limit: int | None = None, flush_every: int
     print(f"  ocr langs: {langs}")
     if not check_hindi_langpack():
         print("  WARNING: Tesseract has no 'hin' language pack -- Hindi OCR will be poor.")
+    missing = missing_langpacks(langs)
+    if missing:
+        print(f"  WARNING: Tesseract is missing the language pack(s) "
+              f"{', '.join(missing)} for {state.name} -- OCR will fail for every "
+              f"page until they are installed.")
+        print(f"           Skipping {state.name}; run the other states, then "
+              f"re-run this one once the pack is available.")
+        return 0
 
     crawl_meta = {m["filename"]: m for m in (jsonio.read_json(state.crawl_metadata, default=[]) or [])}
 
@@ -360,7 +383,7 @@ def process_state(state: StateConfig, limit: int | None = None, flush_every: int
 
             meta = crawl_meta.get(fname, {})
             fallback_title = meta.get("link_text") or Path(fname).stem
-            writer.add({
+            entry = {
                 "id": f"doc_{doc_number}",
                 "filename": fname,
                 "inferred_title": infer_title(text, fallback_title),
@@ -371,14 +394,26 @@ def process_state(state: StateConfig, limit: int | None = None, flush_every: int
                 "state_key": state.key,
                 "category": meta.get("category", "General / Uncategorized"),
                 "link_text": meta.get("link_text", fname),
-                # Full-text extraction beats the crawl-time best effort (which
-                # only saw the text layer); fall back to it for scanned PDFs
-                # that had no text layer at crawl time.
-                "document_date": dates.extract_date(text) or meta.get("document_date"),
+                # Precedence: a date printed in the portal's own listing table
+                # wins outright -- it is authoritative, structured, and unlike
+                # the other two it also exists for scanned documents that have
+                # no text layer.  Then full-text extraction (which saw the whole
+                # document), then the crawl-time text-layer read.  table_date is
+                # absent for every state without a listing table, so their
+                # long-standing precedence is untouched.
+                "document_date": (meta.get("table_date")
+                                  or dates.extract_date(text)
+                                  or meta.get("document_date")),
                 "char_count": len(text),
                 "was_ocr_used": was_ocr_used,
                 "text": text,
-            })
+            }
+            # Fields the portal published about the document, present only where
+            # the crawl captured a listing table (Karnataka today).
+            for field in ("subject", "order_no", "source_org", "medium"):
+                if meta.get(field):
+                    entry[field] = meta[field]
+            writer.add(entry)
             doc_number += 1
             processed += 1
             print(f"    {len(text):,} chars extracted (ocr={was_ocr_used})")

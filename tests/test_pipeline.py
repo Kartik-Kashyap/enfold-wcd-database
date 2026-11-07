@@ -10,15 +10,21 @@ Run:  python -m pytest -q
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import re
+import ssl
 import sys
 from datetime import date
 from pathlib import Path
 
 import pytest
+import requests.certs
+from bs4 import BeautifulSoup
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline import crawler, dates, jsonio, quality
+from pipeline import crawler, dates, jsonio, paths, quality
 from pipeline.chunking import chunk_with_offsets
 from pipeline.filters import build_where_filter
 from pipeline.states import STATES, StateConfig
@@ -823,3 +829,458 @@ class TestSplitForTranslation:
 
     def test_empty(self):
         assert split_for_translation("") == []
+
+
+# ---------------------------------------------------------------------------
+# Karnataka listing-table metadata (wcd.karnataka.gov.in)
+#
+# Trimmed from the real portal: a header row labelling its columns in Kannada,
+# and document rows whose download links read only "Download" -- so the subject,
+# order number, issue date, originating body and language exist nowhere but the
+# table row itself.
+# ---------------------------------------------------------------------------
+KARNATAKA_TABLE_HTML = """
+<table class="table-striped table-bordered table">
+ <tbody>
+  <tr>
+   <td><strong>ವಿಷಯ</strong></td>
+   <td><strong>ಆದೇಶ ಸಂಖ್ಯೆ / ದಿನಾಂಕ</strong></td>
+   <td><strong>ಮೂಲ</strong></td>
+   <td><strong>ಮಾಧ್ಯಮ</strong></td>
+   <td><strong>ಗಾತ್ರ</strong></td>
+   <td><strong>ಡೌನ್‌ಲೋಡ್</strong></td>
+  </tr>
+  <tr>
+   <td><p>ಸುಧಾರಣಾ ಸಂಸ್ಥೆಗಳ ಮಹಿಳಾ ನಿವಾಸಿಗಳ ವಿವಾಹ ಕಾರ್ಯಕ್ರಮದಡಿ ನೀಡಲಾಗುತ್ತಿರುವ ಆರ್ಥಿಕ ನೆರವನ್ನು ಹೆಚ್ಚಿಸುವ ಕುರಿತು.</p></td>
+   <td><p>ಮಮಇ 293 ಮಮಅ 2005, 05.05.2007</p></td>
+   <td>ಇಲಾಖೆ</td>
+   <td>ಕನ್ನಡ</td>
+   <td>2KB</td>
+   <td><a href="https://wcd.karnataka.gov.in/uploads/media_to_upload1753699634.pdf" target="_blank">Download</a></td>
+  </tr>
+  <tr>
+   <td><p>ಮಹಿಳಾ ಮತ್ತು ಮಕ್ಕಳ ಅಭಿವೃದ್ಧಿ ಇಲಾಖೆ ಯೋಜನೆಗಳನ್ನು ಮುಂದುವರೆಸುವ ಬಗ್ಗೆ.</p></td>
+   <td><p>ಮಮಇ 41 ಸ್ವೀಮರ 2020,</p><p>22.06.2020</p></td>
+   <td>&nbsp;ಇಲಾಖೆ</td>
+   <td>&nbsp;ಕನ್ನಡ&nbsp;</td>
+   <td>&nbsp;2KB</td>
+   <td><a href="https://wcd.karnataka.gov.in/uploads/media_to_upload1759478376.pdf" target="_blank">DOWNLOAD</a></td>
+  </tr>
+  <tr>
+   <td>ಅಂಗನವಾಡಿ ಕಾರ್ಯಕರ್ತೆಯರ ಆಯ್ಕೆ ಮಾರ್ಗಸೂಚಿ ಹಾಗೂ ಅರ್ಹತೆಯ ಮಾನದಂಡ</td>
+   <td>ಮಮಇ 237 ಐಸಿಡಿ 2012, 15.06.2012</td>
+   <td>ಇಲಾಖೆ</td>
+   <td>ಕನ್ನಡ</td>
+   <td>2KB</td>
+   <td><a href="https://wcd.karnataka.gov.in/uploads/media_to_upload1753350170.pdf" target="_blank">Download</a></td>
+  </tr>
+ </tbody>
+</table>
+"""
+
+
+def _karnataka_rows():
+    soup = BeautifulSoup(KARNATAKA_TABLE_HTML, "html.parser")
+    return soup.find_all("tr")[1:]  # [0] is the header row
+
+
+class TestKarnatakaListingTable:
+    def test_headers_map_to_canonical_fields(self):
+        table = BeautifulSoup(KARNATAKA_TABLE_HTML, "html.parser").find("table")
+        assert crawler.listing_headers(table) == [
+            "subject", "order", "source_org", "medium", "size_reported", None,
+        ]
+
+    def test_row_captures_the_portal_published_fields(self):
+        meta = crawler.parse_listing_row(_karnataka_rows()[0].find("a"))
+        assert meta["order_no"] == "ಮಮಇ 293 ಮಮಅ 2005"
+        assert meta["source_org"] == "ಇಲಾಖೆ"
+        assert meta["medium"] == "ಕನ್ನಡ"
+        assert meta["size_reported"] == "2KB"
+        assert meta["subject"].startswith("ಸುಧಾರಣಾ ಸಂಸ್ಥೆಗಳ")
+
+    def test_issue_date_comes_from_the_order_cell(self):
+        meta = crawler.parse_listing_row(_karnataka_rows()[0].find("a"))
+        assert meta["table_date"] == "2007-05-05"
+
+    def test_date_split_across_paragraphs_still_parses(self):
+        """Row 2 breaks the order cell over two <p> tags; row 3 is inline."""
+        second = crawler.parse_listing_row(_karnataka_rows()[1].find("a"))
+        assert second["table_date"] == "2020-06-22"
+        assert second["order_no"] == "ಮಮಇ 41 ಸ್ವೀಮರ 2020"
+        third = crawler.parse_listing_row(_karnataka_rows()[2].find("a"))
+        assert third["table_date"] == "2012-06-15"
+
+    def test_non_breaking_spaces_are_cleaned(self):
+        meta = crawler.parse_listing_row(_karnataka_rows()[1].find("a"))
+        assert meta["source_org"] == "ಇಲಾಖೆ"
+        assert meta["medium"] == "ಕನ್ನಡ"
+
+    def test_inline_date_label_is_stripped_from_the_order_number(self):
+        """Live rows read "ಮಮಇ 81 ಮಮಅ 2025, ದಿನಾಂಕ:04.04.2025" (wcd /75/2025/kn)."""
+        soup = BeautifulSoup(
+            '<table>'
+            '<tr><td><strong>ವಿಷಯ</strong></td>'
+            '<td><strong>ಆದೇಶ ಸಂಖ್ಯೆ / ದಿನಾಂಕ</strong></td></tr>'
+            '<tr><td>ಗೃಹಲಕ್ಷ್ಮಿ ಯೋಜನೆಯನ್ನು ಮುಂದುವರೆಸುವ ಬಗ್ಗೆ.</td>'
+            '<td>ಮಮಇ 81 ಮಮಅ 2025, ದಿನಾಂಕ:04.04.2025</td>'
+            '<td><a href="/uploads/media_to_upload1753436610.pdf">Download</a></td></tr>'
+            '</table>',
+            "html.parser",
+        )
+        meta = crawler.parse_listing_row(soup.find("a"))
+        assert meta["table_date"] == "2025-04-04"
+        assert meta["order_no"] == "ಮಮಇ 81 ಮಮಅ 2025"
+
+    def test_parenthesised_order_number_survives(self):
+        """Live row "ಮಮಇ 70 ಮಮಅ 2023 (ಭಾ-20), 23.02.2024" (wcd /76/2024/kn)."""
+        soup = BeautifulSoup(
+            '<table>'
+            '<tr><td><strong>ವಿಷಯ</strong></td>'
+            '<td><strong>ಆದೇಶ ಸಂಖ್ಯೆ / ದಿನಾಂಕ</strong></td></tr>'
+            '<tr><td>ಗೃಹಲಕ್ಷ್ಮಿ ಯೋಜನೆಯ ಸೌಲಭ್ಯದ ಕುರಿತು.</td>'
+            '<td>ಮಮಇ 70 ಮಮಅ 2023 (ಭಾ-20), 23.02.2024</td>'
+            '<td><a href="/uploads/media_to_upload1753425960.pdf">Download</a></td></tr>'
+            '</table>',
+            "html.parser",
+        )
+        meta = crawler.parse_listing_row(soup.find("a"))
+        assert meta["table_date"] == "2024-02-23"
+        assert meta["order_no"] == "ಮಮಇ 70 ಮಮಅ 2023 (ಭಾ-20)"
+
+    def test_a_link_wrapped_in_a_paragraph_inside_the_cell_still_matches(self):
+        """Live rows wrap the anchor as a <td><p><a>; find_parent must cope."""
+        soup = BeautifulSoup(
+            '<table>'
+            '<tr><td><strong>ವಿಷಯ</strong></td>'
+            '<td><strong>ಆದೇಶ ಸಂಖ್ಯೆ / ದಿನಾಂಕ</strong></td></tr>'
+            '<tr><td>ವಿಷಯ ಪಠ್ಯ</td><td>ಮಮಇ 1 ಮಮಅ 2024, 01.02.2024</td>'
+            '<td><p><a href="/uploads/media_to_upload1.pdf">Download</a></p></td></tr>'
+            '</table>',
+            "html.parser",
+        )
+        meta = crawler.parse_listing_row(soup.find("a"))
+        assert meta["table_date"] == "2024-02-01"
+
+    def test_a_link_outside_a_table_captures_nothing(self):
+        soup = BeautifulSoup('<p><a href="/a.pdf">Download</a></p>', "html.parser")
+        assert crawler.parse_listing_row(soup.find("a")) == {}
+
+    def test_a_table_without_a_recognisable_header_captures_nothing(self):
+        """No Kannada header means no fields -- never a positional guess."""
+        soup = BeautifulSoup(
+            '<table><tr><td>a</td><td>b</td></tr>'
+            '<tr><td>x</td><td><a href="/a.pdf">Download</a></td></tr></table>',
+            "html.parser",
+        )
+        assert crawler.parse_listing_row(soup.find("a")) == {}
+
+    def test_a_spanning_caption_row_is_not_a_header(self):
+        """The real table at wcd /84/gradation-lists.../kn (found on a live crawl).
+
+        It opens with one caption cell spanning all five columns, reading
+        "...ವಿವಿಧ ವೃಂದಗಳ ದಿನಾಂಕ:01.01.2025ರಲ್ಲಿದ್ದಂತೆ ಜ್ಯೇಷ್ಠತಾ ಪಟ್ಟಿಗಳು." -- which
+        contains the ದಿನಾಂಕ marker.  Accepting that caption as the header maps
+        column 0 to "order", so every row's *serial number* (1, 2, 3...) was
+        recorded as its government order number, with no subject and no date.
+        """
+        soup = BeautifulSoup(
+            '<table>'
+            '<tr><td colspan="5"><strong>ಮಹಿಳಾ ಮತ್ತು ಮಕ್ಕಳ ಅಭಿವೃದ್ದಿ ಹಾಗೂ '
+            'ವಿಕಲಚೇತನರ ಮತ್ತು ಹಿರಿಯ ನಾಗರಿಕರ ಸಬಲೀಕರಣ ಇಲಾಖೆಯ ವಿವಿಧ ವೃಂದಗಳ '
+            'ದಿನಾಂಕ:01.01.2025ರಲ್ಲಿದ್ದಂತೆ ಜ್ಯೇಷ್ಠತಾ ಪಟ್ಟಿಗಳು.</strong></td></tr>'
+            '<tr><td>Sl No</td><td>Cadre</td><td>Government Notification</td>'
+            '<td>Provisional list Date</td><td>Final list Date</td></tr>'
+            '<tr><td>1</td><td>ಜಂಟಿ ನಿರ್ದೇಶಕರು</td>'
+            '<td>ಮಮಇ 54 ಎಸ್‌ಜೆಡಿ 2025</td>'
+            '<td><a href="/uploads/media_to_upload1763188850.pdf">04.03.2025</a></td>'
+            '<td>17.09.2025</td></tr>'
+            '</table>',
+            "html.parser",
+        )
+        assert crawler.listing_headers(soup.find("table")) == []
+        assert crawler.parse_listing_row(soup.find("a")) == {}
+
+    def test_a_header_wider_than_the_data_row_is_rejected(self):
+        """A positional mapping only holds when both rows have the same shape."""
+        soup = BeautifulSoup(
+            '<table>'
+            '<tr><th>ವಿಷಯ</th><th>ದಿನಾಂಕ</th><th>ಮೂಲ</th></tr>'
+            '<tr><td>ಒಂದು ದಾಖಲೆ</td><td><a href="/a.pdf">Download</a></td></tr>'
+            '</table>',
+            "html.parser",
+        )
+        assert crawler.parse_listing_row(soup.find("a")) == {}
+
+    def test_the_real_table_still_maps_after_the_caption_guard(self):
+        """The guard must not cost us the tables that were parsing correctly."""
+        table = BeautifulSoup(KARNATAKA_TABLE_HTML, "html.parser").find("table")
+        row = _karnataka_rows()[0]
+        assert crawler.listing_headers(table, row) == [
+            "subject", "order", "source_org", "medium", "size_reported", None,
+        ]
+        assert crawler.parse_listing_row(row.find("a"))["table_date"] == "2007-05-05"
+
+    def test_subject_drives_category_inference(self):
+        """The anchor text is only "Download"; the subject carries the signal."""
+        meta = crawler.parse_listing_row(_karnataka_rows()[1].find("a"))
+        assert crawler.determine_category("", "", meta["subject"]) == "Schemes & Programs"
+        assert crawler.determine_category("", "", "Download") == "General / Uncategorized"
+
+    def test_kannada_keywords_are_recognised(self):
+        assert crawler.determine_category("", "", "ಅಧಿನಿಯಮ") == "Acts & Rules"
+        assert crawler.determine_category("", "", "ಸುತ್ತೋಲೆ") == "Circulars & Orders"
+        assert crawler.determine_category("", "", "ಮಾರ್ಗಸೂಚಿ") == "SOPs & Guidelines"
+        assert crawler.determine_category("", "", "ವಾರ್ಷಿಕ ವರದಿ") == "Reports"
+
+
+class TestKarnatakaStateConfig:
+    def test_registered_with_kannada_and_table_capture(self):
+        ks = STATES["karnataka"]
+        assert ks.name == "Karnataka"
+        assert ks.start_url == "https://wcd.karnataka.gov.in/"
+        assert ks.ocr_langs == "kan+eng"
+        assert ks.language_code == "kn"
+        assert ks.capture_table_metadata is True
+        assert ks.filename_from_url is True
+
+    def test_existing_states_are_untouched_by_the_new_fields(self):
+        """The five shipped states keep their OCR langs, their default
+        (link-text) naming, and no table capture."""
+        for key in ("cg", "bihar", "up", "delhi"):
+            s = STATES[key]
+            assert s.ocr_langs == "hin+eng"
+            assert s.language_code == "hi"
+            assert s.capture_table_metadata is False
+            assert s.filename_from_url is False
+
+    def test_new_fields_default_off(self):
+        bare = StateConfig(key="x", name="X", start_url="https://x.in/",
+                           data_dirname="x", pdf_dirname="pdfs")
+        assert bare.language_code == "hi"
+        assert bare.capture_table_metadata is False
+        assert bare.filename_from_url is False
+
+
+class TestFilenameFromUrl:
+    def test_names_from_the_url_basename(self):
+        """Karnataka's links all read "Download", so the URL is the only signal."""
+        assert crawler.filename_from_url(
+            "https://wcd.karnataka.gov.in/uploads/media_to_upload1753699634.pdf", 1
+        ) == "media_to_upload1753699634.pdf"
+
+    def test_query_string_and_fragment_are_dropped(self):
+        assert crawler.filename_from_url(
+            "https://x.in/uploads/doc42.pdf?v=2#page=1", 1) == "doc42.pdf"
+
+    def test_unsafe_characters_are_replaced(self):
+        assert crawler.filename_from_url("https://x.in/u/a%20b.pdf", 1) == "a_20b.pdf"
+
+    def test_extension_is_added_when_the_path_has_none(self):
+        assert crawler.filename_from_url(
+            "https://x.in/u/DownloadFile.ashx", 1) == "DownloadFile.ashx.pdf"
+
+    def test_falls_back_when_the_url_has_no_basename(self):
+        assert crawler.filename_from_url("https://x.in/", 7) == "document_7.pdf"
+
+    def test_a_name_already_taken_is_disambiguated(self):
+        taken = {"doc42.pdf"}
+        assert crawler.filename_from_url("https://x.in/u/doc42.pdf", 9, taken) == "doc42_9.pdf"
+
+    def test_a_percent_encoded_basename_still_yields_a_usable_name(self):
+        name = crawler.filename_from_url("https://x.in/u/%E0%B2%A6%E0%B2%B8.pdf", 1)
+        assert name.endswith(".pdf") and name != "document_1.pdf"
+
+
+class TestTableDatePrecedence:
+    """A portal-published date outranks anything read out of the document."""
+
+    def _state_and_stub(self, tmp_path, monkeypatch, crawl_entry, text):
+        from pipeline import ocr, paths
+
+        monkeypatch.setattr(paths, "REPO_ROOT", tmp_path)
+        state = StateConfig(key="k", name="K", start_url="https://k.in/",
+                            data_dirname="k", pdf_dirname="pdfs")
+        state.pdf_dir.mkdir(parents=True)
+        (state.pdf_dir / "doc.pdf").write_bytes(b"%PDF-1.4\n")
+        jsonio.write_json_atomic(state.crawl_metadata, [crawl_entry])
+        monkeypatch.setattr(ocr, "configure_tesseract", lambda: "tesseract")
+        monkeypatch.setattr(ocr, "check_hindi_langpack", lambda: True)
+        monkeypatch.setattr(ocr, "missing_langpacks", lambda langs: [])
+        monkeypatch.setattr(ocr, "extract_text", lambda p, lang=None: (text, False))
+        return ocr, state
+
+    def test_table_date_beats_ocr_text_and_the_pdf_read(self, tmp_path, monkeypatch):
+        ocr, state = self._state_and_stub(
+            tmp_path, monkeypatch,
+            {"filename": "doc.pdf", "table_date": "2007-05-05",
+             "document_date": "1999-01-01", "subject": "s"},
+            "दिनांक 15/03/2024 को जारी",
+        )
+        ocr.process_state(state)
+        docs = jsonio.read_json(state.processed_docs)
+        assert docs[0]["document_date"] == "2007-05-05"
+
+    def test_without_a_table_date_ocr_text_still_wins(self, tmp_path, monkeypatch):
+        """The five existing states have no table_date, so nothing changes."""
+        ocr, state = self._state_and_stub(
+            tmp_path, monkeypatch,
+            {"filename": "doc.pdf", "document_date": "1999-01-01"},
+            "दिनांक 15/03/2024 को जारी",
+        )
+        ocr.process_state(state)
+        docs = jsonio.read_json(state.processed_docs)
+        assert docs[0]["document_date"] == "2024-03-15"
+
+    def test_captured_fields_reach_processed_docs(self, tmp_path, monkeypatch):
+        ocr, state = self._state_and_stub(
+            tmp_path, monkeypatch,
+            {"filename": "doc.pdf", "subject": "ವಿಷಯ", "order_no": "ಮಮಇ 293",
+             "source_org": "ಇಲಾಖೆ", "medium": "ಕನ್ನಡ"},
+            "some text",
+        )
+        ocr.process_state(state)
+        doc = jsonio.read_json(state.processed_docs)[0]
+        assert doc["subject"] == "ವಿಷಯ"
+        assert doc["order_no"] == "ಮಮಇ 293"
+        assert doc["source_org"] == "ಇಲಾಖೆ"
+        assert doc["medium"] == "ಕನ್ನಡ"
+
+    def test_states_without_the_fields_do_not_gain_empty_keys(self, tmp_path, monkeypatch):
+        ocr, state = self._state_and_stub(
+            tmp_path, monkeypatch, {"filename": "doc.pdf"}, "some text")
+        ocr.process_state(state)
+        doc = jsonio.read_json(state.processed_docs)[0]
+        assert "subject" not in doc and "order_no" not in doc
+
+
+class TestMissingLangpacks:
+    def test_reports_a_pack_that_is_not_installed(self, monkeypatch):
+        from pipeline import ocr
+        monkeypatch.setattr(ocr.pytesseract, "get_languages",
+                            lambda config="": ["eng", "hin", "ori", "osd"])
+        assert ocr.missing_langpacks("kan+eng") == ["kan"]
+        assert ocr.missing_langpacks("hin+eng") == []
+
+    def test_no_warning_when_languages_cannot_be_listed(self, monkeypatch):
+        from pipeline import ocr
+
+        def boom(config=""):
+            raise RuntimeError("no tesseract")
+
+        monkeypatch.setattr(ocr.pytesseract, "get_languages", boom)
+        assert ocr.missing_langpacks("kan+eng") == []
+
+
+# ---------------------------------------------------------------------------
+# Karnataka — the portal serves an incomplete TLS chain
+# ---------------------------------------------------------------------------
+class TestKarnatakaTlsChain:
+    """wcd.karnataka.gov.in sends a chain that no client can verify.
+
+    The leaf was renewed onto GlobalSign's R46 intermediate, but the handshake
+    still carries the *previous* intermediate.  `openssl s_client` reports
+    "Verify return code: 21 (unable to verify the first certificate)",
+    `requests` raises CERTIFICATE_VERIFY_FAILED and curl exits 60 — on the
+    laptop and on the Oracle box alike, so it is the server's fault, not ours.
+
+    The fix appends the intermediate the server forgot (its own AIA extension
+    points straight at it) to the standard trust store.  These tests pin both
+    halves of that: the certificate is the right one, and nothing about
+    verification was weakened to make the crawl work.
+    """
+
+    CERT = "globalsign-gcc-r46-ov-tls-ca-2025.pem"
+
+    def test_karnataka_names_the_vendored_intermediate(self):
+        assert STATES["karnataka"].extra_ca == self.CERT
+
+    def test_the_vendored_file_is_in_the_repo(self):
+        cert = paths.CERTS_DIR / self.CERT
+        assert cert.is_file(), f"{cert} is missing -- the Karnataka crawl cannot verify"
+
+    def test_no_other_state_needs_an_extra_certificate(self):
+        """The five original states verified fine; only Karnataka is patched."""
+        others = [s for s in STATES.values() if s.key != "karnataka"]
+        assert others, "expected the original states to still be registered"
+        assert all(s.extra_ca is None for s in others)
+
+    def test_vendored_certificate_is_the_one_the_server_points_at(self):
+        """Fingerprint, issuer and expiry, so a stale file cannot sit here silently.
+
+        The value below is what `openssl x509 -fingerprint -sha256` printed for
+        the certificate fetched from the portal's own AIA URI.
+        """
+        cert = paths.CERTS_DIR / self.CERT
+        der = base64.b64decode(
+            "".join(cert.read_text(encoding="utf-8")
+                    .split("-----BEGIN CERTIFICATE-----")[1]
+                    .split("-----END CERTIFICATE-----")[0].split()))
+        assert len(der) == 1408
+        fingerprint = ":".join(f"{b:02X}" for b in hashlib.sha256(der).digest())
+        assert fingerprint == (
+            "D1:60:E2:DE:4E:56:CB:10:B6:6C:1C:B0:AD:CB:79:CF:"
+            "93:C7:8D:CD:9D:B3:0C:20:18:22:02:62:C0:40:63:F9")
+
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(cafile=str(cert))
+        ours = [c for c in ctx.get_ca_certs()
+                if "GCC R46 OV TLS CA 2025" in str(c["subject"])]
+        assert ours, "the vendored file does not contain the expected intermediate"
+        # Its issuer is a root certifi already trusts, which is exactly why
+        # appending it restores verification instead of bypassing it.
+        assert "GlobalSign Root R46" in str(ours[0]["issuer"])
+
+    def test_states_without_an_extra_ca_use_the_default_store(self):
+        for state in STATES.values():
+            if state.extra_ca is None:
+                assert crawler.verify_for(state) is True
+
+    def test_missing_file_falls_back_to_the_default_store(self, monkeypatch, tmp_path):
+        """A deleted certificate must degrade to the normal store, not to no checks."""
+        monkeypatch.setattr(paths, "CERTS_DIR", tmp_path / "empty")
+        monkeypatch.setattr(paths, "CA_BUNDLE_CACHE", tmp_path / "ca")
+        assert crawler.verify_for(STATES["karnataka"]) is True
+
+    def test_combined_bundle_keeps_every_root_and_adds_exactly_one(self,
+                                                                  monkeypatch, tmp_path):
+        """The safety property: a bundle that dropped roots would be a downgrade."""
+        monkeypatch.setattr(paths, "CA_BUNDLE_CACHE", tmp_path / "ca")
+        bundle = Path(crawler.verify_for(STATES["karnataka"]))
+        assert bundle.is_file()
+
+        base = ssl.create_default_context(cafile=requests.certs.where())
+        combined = ssl.create_default_context(cafile=str(bundle))
+        names = [str(c["subject"]) for c in combined.get_ca_certs()]
+        assert any("GCC R46 OV TLS CA 2025" in n for n in names)
+        # Same roots as the standard store, plus the one intermediate.
+        assert len(combined.get_ca_certs()) == len(base.get_ca_certs()) + 1
+
+    def test_bundle_is_standard_roots_plus_the_extra_certificate(self,
+                                                                 monkeypatch, tmp_path):
+        monkeypatch.setattr(paths, "CA_BUNDLE_CACHE", tmp_path / "ca")
+        bundle = Path(crawler.verify_for(STATES["karnataka"]))
+        payload = bundle.read_bytes()
+        assert payload.startswith(Path(requests.certs.where()).read_bytes().rstrip())
+        assert payload.rstrip().endswith(b"-----END CERTIFICATE-----")
+        assert (paths.CERTS_DIR / self.CERT).read_bytes().strip() in payload
+
+    def test_bundle_is_reused_rather_than_rebuilt(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(paths, "CA_BUNDLE_CACHE", tmp_path / "ca")
+        first = Path(crawler.verify_for(STATES["karnataka"]))
+        stamp = first.stat().st_mtime_ns
+        assert Path(crawler.verify_for(STATES["karnataka"])) == first
+        assert first.stat().st_mtime_ns == stamp
+
+    def test_crawler_never_disables_verification(self):
+        """`verify=False` anywhere in a request would make the corpus forgeable.
+
+        The vendored-certificate route exists precisely so nobody is tempted to
+        reach for it; this guards the invariant against a future edit.
+        """
+        source = re.sub(r"\s+", " ", Path(crawler.__file__).read_text(encoding="utf-8"))
+        calls = re.findall(r"requests\.get\((.{0,160}?)\)", source)
+        assert len(calls) == 3, "expected the three download call sites"
+        for call in calls:
+            assert "verify=verify" in call, f"a request lost its verify argument: {call}"
+            assert "verify=False" not in call

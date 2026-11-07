@@ -28,6 +28,28 @@ class StateConfig:
     # documents are in Odia script, which needs the 'ori' pack.  Adding 'ori'
     # to every state costs ~40% OCR time per page, so it is opt-in here.
     ocr_langs: str = "hin+eng"
+    # ISO 639-1 code of the documents' own language, recorded in the vector
+    # index so a Kannada hit is not mislabelled as Hindi (see pipeline/index.py).
+    language_code: str = "hi"
+    # Karnataka serves every PDF from `uploads/media_to_upload<id>.pdf` behind a
+    # link whose text is the single word "Download", so the usual
+    # link-text-derived name would make every file `Download_<n>.pdf`.  Naming
+    # from the URL instead gives stable, unique, re-crawl-safe filenames.
+    filename_from_url: bool = False
+    # Karnataka lists each document in a table row that carries the subject,
+    # order number, issue date, originating body and language.  Capturing the
+    # row means those fields are known from the portal rather than guessed from
+    # the PDF text later -- and the issue date survives even for scanned
+    # documents that have no text layer to extract a date from.
+    capture_table_metadata: bool = False
+    # Some portals serve an incomplete TLS chain -- the leaf plus an *old*
+    # intermediate that did not sign it -- and every ordinary client then rejects
+    # the handshake (requests raises CERTIFICATE_VERIFY_FAILED, curl exits 60).
+    # Naming a PEM from `pipeline/certs/` here appends that certificate to the
+    # standard trust store for this state's requests: the chain is still verified
+    # end to end, it just gets the intermediate the server forgot to send.  This
+    # does NOT disable verification.  See `crawler.verify_for` for why.
+    extra_ca: str | None = None
 
     @property
     def domain(self) -> str:
@@ -86,6 +108,25 @@ STATES: dict[str, StateConfig] = {
         start_url="https://wcd.delhi.gov.in/",
         data_dirname="delhi",
         pdf_dirname="dwcd_all_pdfs",
+    ),
+    "karnataka": StateConfig(
+        key="karnataka",
+        name="Karnataka",
+        start_url="https://wcd.karnataka.gov.in/",
+        data_dirname="karnataka",
+        pdf_dirname="kwcd_all_pdfs",
+        # Kannada documents need the 'kan' pack, which is NOT installed on the
+        # Oracle box (it has eng/hin/ori/osd only).  OCR for this state needs
+        # `sudo apt install tesseract-ocr-kan` by whoever has root; until then
+        # the crawl and its metadata still work, only text extraction is blocked.
+        ocr_langs="kan+eng",
+        language_code="kn",
+        filename_from_url=True,
+        capture_table_metadata=True,
+        # This portal renewed its leaf onto GlobalSign's R46 intermediate but
+        # still serves the previous one, so the chain it sends does not verify
+        # on any client.  The certificate it forgot to send is vendored here.
+        extra_ca="globalsign-gcc-r46-ov-tls-ca-2025.pem",
     ),
 }
 

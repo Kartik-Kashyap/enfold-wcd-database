@@ -67,11 +67,15 @@ def cmd_status(args) -> int:
         if count:
             sample = collection.get(limit=min(count, 500), include=["metadatas"])
             langs = {m.get("language", "?") for m in sample["metadatas"]}
+            # The corpus is no longer Hindi-only once Karnataka's Kannada
+            # documents are indexed, so compare against the languages the state
+            # registry actually declares rather than hardcoding 'hi'.
+            expected = {s.language_code for s in states_mod.all_states()}
             by_state: dict[str, int] = {}
             for m in sample["metadatas"]:
                 by_state[m.get("state", "?")] = by_state.get(m.get("state", "?"), 0) + 1
             print(f"    indexed language(s): {', '.join(sorted(langs))} "
-                  f"{'(Hindi source — correct)' if langs == {'hi'} else '(!! expected only hi)'}")
+                  f"{'(as configured per state)' if langs <= expected else '(!! unexpected language in index)'}")
             print(f"    sample by state:     {by_state}")
     except Exception as exc:
         print(f"  Vector index: not built yet ({exc})")
